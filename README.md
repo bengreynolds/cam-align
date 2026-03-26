@@ -1,0 +1,33 @@
+# cam-align
+
+Portable standalone application for manual camera-alignment and offset compensation.
+
+## Goals
+
+- inspect a single session/raw folder
+- determine master and secondary cameras
+- preview master, raw secondary, and compensated secondary frames side-by-side
+- dry-run compensation policy
+- mutate files in place only after automatic backup
+- support explicit undo
+- restore originals automatically on failure
+
+## Run
+
+```powershell
+python -m pip install -r requirements.txt
+python run_app.py
+```
+
+Or install editable and run:
+
+```powershell
+python -m pip install -e .
+cam-align
+```
+
+## Notes
+
+- The tool is self-contained and does not import `reachx`.
+- It is intended to be portable: copy this folder elsewhere and run it with its own environment.
+- Compensation keeps the master timeline authoritative and applies offsets only to selected secondary cameras.
