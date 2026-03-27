@@ -186,6 +186,8 @@ class MainWindow(QMainWindow):
                 f"Root: {inspection.root}",
                 f"Mode: {inspection.mode.value}",
                 f"Master camera: {inspection.master_camera}",
+                "Length rule: compensation requires the selected master/secondary pair to end at the same frame count.",
+                "Auto-trim policy: the longer side is trimmed at the end when the mismatch is 100 frames or less.",
                 "Detected cameras:",
                 *[
                     f"  - {cam}: frames={info.frame_count} fps={info.fps:.2f} size={info.width}x{info.height}"

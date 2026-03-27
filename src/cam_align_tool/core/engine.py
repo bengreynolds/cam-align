@@ -48,6 +48,7 @@ _SHIFTABLE_FUSED_H5_PATTERNS = [
     "_filtered3d_pixels.h5",
     "_pix3d.h5",
 ]
+_MAX_AUTO_TRIM_FRAMES = 100
 
 
 def _norm(path: Path) -> str:
@@ -58,14 +59,42 @@ def _contains_camera_token(path: Path, camera: str) -> bool:
     return camera.lower() in path.name.lower()
 
 
-def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camera: str) -> Artifact:
+def _target_frame_count(inspection: InspectionResult, secondary_camera: str) -> int:
+    master_rows = inspection.camera_files[inspection.master_camera].frame_count
+    secondary_rows = inspection.camera_files[secondary_camera].frame_count
+    diff = abs(master_rows - secondary_rows)
+    if diff > _MAX_AUTO_TRIM_FRAMES:
+        raise RuntimeError(
+            "Master/secondary frame-count mismatch exceeds auto-trim limit: "
+            f"{inspection.master_camera}={master_rows}, {secondary_camera}={secondary_rows}, "
+            f"diff={diff}, limit={_MAX_AUTO_TRIM_FRAMES}"
+        )
+    return min(master_rows, secondary_rows)
+
+
+def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camera: str, target_frame_count: int) -> Artifact:
     name_lower = path.name.lower()
     master_info = inspection.camera_files.get(inspection.master_camera)
     secondary_info = inspection.camera_files.get(secondary_camera)
-    expected_rows = secondary_info.frame_count if secondary_info is not None else None
+    secondary_rows = secondary_info.frame_count if secondary_info is not None else None
     master_rows = master_info.frame_count if master_info is not None else None
     if any(name_lower.endswith(pattern.lower()) for pattern in _HIGH_RISK_PATTERNS):
         return Artifact(path=path, action=ChangeAction.INVALIDATE, reason="high_risk_fused_output")
+
+    if (
+        master_info is not None
+        and master_rows is not None
+        and master_rows > target_frame_count
+        and _norm(path) == _norm(master_info.video_path)
+    ):
+        return Artifact(
+            path=path,
+            action=ChangeAction.REWRITE,
+            reason="master_video_trim",
+            kind=TransformKind.VIDEO,
+            camera=inspection.master_camera,
+            row_count=target_frame_count,
+        )
 
     if secondary_info is not None and _norm(path) == _norm(secondary_info.video_path):
         return Artifact(
@@ -74,7 +103,7 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
             reason="secondary_video",
             kind=TransformKind.VIDEO,
             camera=secondary_camera,
-            row_count=secondary_info.frame_count,
+            row_count=target_frame_count,
         )
 
     if name_lower == f"{secondary_camera.lower()}.npy":
@@ -84,7 +113,7 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
             reason="secondary_inference_npy",
             kind=TransformKind.SCORER_OUTPUT_NPY,
             camera=secondary_camera,
-            row_count=master_rows,
+            row_count=target_frame_count,
         )
 
     if name_lower == "detected_markers.npy":
@@ -94,7 +123,7 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
             reason="secondary_rows_in_detected_markers",
             kind=TransformKind.DETECTED_MARKERS_NPY,
             camera=secondary_camera,
-            row_count=master_rows,
+            row_count=target_frame_count,
         )
 
     if name_lower in {"hand.npy", "pellet.npy"}:
@@ -103,7 +132,7 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
             action=ChangeAction.REWRITE,
             reason="derived_timeseries_npy",
             kind=TransformKind.NPY_TIMESERIES,
-            row_count=master_rows,
+            row_count=target_frame_count,
         )
 
     if not _contains_camera_token(path, secondary_camera):
@@ -123,7 +152,7 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
                 action=ChangeAction.REWRITE,
                 reason="derived_fused_dataframe_h5",
                 kind=TransformKind.DATAFRAME_H5,
-                row_count=row_count,
+                row_count=target_frame_count,
             )
         return Artifact(path=path, action=ChangeAction.SKIP, reason="not_target_camera")
 
@@ -134,7 +163,7 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
             reason="camera_frame_list",
             kind=TransformKind.FRAME_LIST,
             camera=secondary_camera,
-            row_count=expected_rows,
+            row_count=target_frame_count,
         )
 
     if path.suffix.lower() == ".h5":
@@ -146,7 +175,7 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
                 row_count = int(store[keys[0]].shape[0]) if keys else None
         except Exception:
             return Artifact(path=path, action=ChangeAction.SKIP, reason="unsupported_h5")
-        if expected_rows is not None and row_count != expected_rows:
+        if secondary_rows is not None and row_count != secondary_rows:
             return Artifact(path=path, action=ChangeAction.SKIP, reason="unexpected_h5_row_count")
         return Artifact(
             path=path,
@@ -154,7 +183,7 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
             reason="camera_dataframe_h5",
             kind=TransformKind.DATAFRAME_H5,
             camera=secondary_camera,
-            row_count=row_count,
+            row_count=target_frame_count,
         )
 
     if path.suffix.lower() == ".csv":
@@ -174,7 +203,7 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
             row_count = best_rows
         except Exception:
             return Artifact(path=path, action=ChangeAction.SKIP, reason="unsupported_csv")
-        if expected_rows is not None and row_count != expected_rows:
+        if secondary_rows is not None and row_count != secondary_rows:
             return Artifact(path=path, action=ChangeAction.SKIP, reason="unexpected_csv_row_count")
         return Artifact(
             path=path,
@@ -182,7 +211,7 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
             reason="camera_dataframe_csv",
             kind=TransformKind.DATAFRAME_CSV,
             camera=secondary_camera,
-            row_count=row_count,
+            row_count=target_frame_count,
         )
 
     return Artifact(path=path, action=ChangeAction.SKIP, reason="unsupported_or_unchanged")
@@ -193,6 +222,7 @@ def build_plan(inspection: InspectionResult, secondary_camera: str, offset: int)
         raise RuntimeError("Manual offset compensation may only target a secondary camera.")
     if secondary_camera not in inspection.camera_files:
         raise RuntimeError(f"Secondary camera not found in session: {secondary_camera}")
+    target_frame_count = _target_frame_count(inspection, secondary_camera)
 
     rewrites: list[PlannedChange] = []
     invalidations: list[PlannedChange] = []
@@ -200,7 +230,7 @@ def build_plan(inspection: InspectionResult, secondary_camera: str, offset: int)
     seen: set[str] = set()
 
     for path in inspection.all_files:
-        artifact = _artifact_for_path(path, inspection, secondary_camera)
+        artifact = _artifact_for_path(path, inspection, secondary_camera, target_frame_count)
         rel = path.relative_to(inspection.root)
         key = _norm(path)
         if key in seen:
@@ -219,6 +249,7 @@ def build_plan(inspection: InspectionResult, secondary_camera: str, offset: int)
         root=inspection.root,
         secondary=secondary_camera,
         offset=offset,
+        target_frame_count=target_frame_count,
         rewrites=len(rewrites),
         invalidations=len(invalidations),
         skips=len(skips),
@@ -227,6 +258,7 @@ def build_plan(inspection: InspectionResult, secondary_camera: str, offset: int)
         inspection=inspection,
         secondary_camera=secondary_camera,
         offset=int(offset),
+        target_frame_count=target_frame_count,
         rewrites=rewrites,
         invalidations=invalidations,
         skips=skips,
@@ -234,15 +266,22 @@ def build_plan(inspection: InspectionResult, secondary_camera: str, offset: int)
 
 
 def summarize_plan(plan: CompensationPlan) -> PlanSummary:
+    master_rows = plan.inspection.camera_files[plan.inspection.master_camera].frame_count
+    secondary_rows = plan.inspection.camera_files[plan.secondary_camera].frame_count
     lines = [
         f"Root: {plan.inspection.root}",
         f"Mode: {plan.inspection.mode.value}",
         f"Master camera: {plan.inspection.master_camera}",
+        f"Master frames: {master_rows}",
         f"Secondary target: {plan.secondary_camera}",
+        f"Secondary frames: {secondary_rows}",
+        f"Target frame count after trim: {plan.target_frame_count}",
         f"Offset: {plan.offset} (new[t] = raw[t + offset])",
         "",
         f"Rewrite count: {len(plan.rewrites)}",
     ]
+    if master_rows != secondary_rows:
+        lines.insert(6, f"Frame-count normalization: end-trim longer side by {abs(master_rows - secondary_rows)} frame(s)")
     for item in plan.rewrites:
         lines.append(f"  REWRITE {item.artifact.kind.value}: {item.artifact.path.relative_to(plan.inspection.root)}")
     lines.append(f"Invalidate count: {len(plan.invalidations)}")
@@ -308,6 +347,7 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
         "master_camera": plan.inspection.master_camera,
         "secondary_camera": plan.secondary_camera,
         "offset": plan.offset,
+        "target_frame_count": plan.target_frame_count,
         "rewrite_paths": [str(item.artifact.path.relative_to(root)) for item in plan.rewrites],
         "invalidated_paths": [str(item.artifact.path.relative_to(root)) for item in plan.invalidations],
         "restored_paths": [],
@@ -329,19 +369,20 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
             tmp_path = txn_dir / "staging" / rel
             tmp_path.parent.mkdir(parents=True, exist_ok=True)
             if artifact.kind == TransformKind.VIDEO:
-                shift_video_file(artifact.path, tmp_path, plan.offset)
+                video_offset = plan.offset if artifact.camera == plan.secondary_camera else 0
+                shift_video_file(artifact.path, tmp_path, video_offset, output_frame_count=artifact.row_count)
             elif artifact.kind == TransformKind.DATAFRAME_H5:
-                shift_dataframe_h5(artifact.path, tmp_path, plan.offset)
+                shift_dataframe_h5(artifact.path, tmp_path, plan.offset, output_rows=artifact.row_count)
             elif artifact.kind == TransformKind.DATAFRAME_CSV:
-                shift_dataframe_csv(artifact.path, tmp_path, plan.offset)
+                shift_dataframe_csv(artifact.path, tmp_path, plan.offset, output_rows=artifact.row_count)
             elif artifact.kind == TransformKind.FRAME_LIST:
-                frame_count = plan.inspection.camera_files[plan.secondary_camera].frame_count
+                frame_count = plan.target_frame_count
                 shift_frame_list_file(artifact.path, tmp_path, plan.offset, frame_count)
             elif artifact.kind == TransformKind.SCORER_OUTPUT_NPY:
-                frame_count = plan.inspection.camera_files[plan.inspection.master_camera].frame_count
+                frame_count = plan.target_frame_count
                 shift_scorer_output_npy(artifact.path, tmp_path, plan.offset, frame_count)
             elif artifact.kind == TransformKind.DETECTED_MARKERS_NPY:
-                frame_count = plan.inspection.camera_files[plan.inspection.master_camera].frame_count
+                frame_count = plan.target_frame_count
                 camera_value = plan.inspection.cameras.index(plan.secondary_camera)
                 if plan.inspection.mode.value == "legacy":
                     camera_value = {"sideCam": 0, "frontCam": 1, "stimCam": 2, "fastCam": 3}.get(plan.secondary_camera, camera_value)
@@ -349,7 +390,7 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
                     camera_value = {"left": 4, "right": 5}.get(plan.secondary_camera, camera_value)
                 shift_detected_markers_npy(artifact.path, tmp_path, plan.offset, frame_count, camera_value)
             elif artifact.kind == TransformKind.NPY_TIMESERIES:
-                shift_timeseries_npy(artifact.path, tmp_path, plan.offset)
+                shift_timeseries_npy(artifact.path, tmp_path, plan.offset, output_rows=artifact.row_count)
             else:
                 raise RuntimeError(f"Unhandled rewrite kind: {artifact.kind}")
             verify_transform(artifact.kind, backup, tmp_path, artifact.row_count)

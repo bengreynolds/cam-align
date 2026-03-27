@@ -70,6 +70,7 @@ class CompensationPlan:
     inspection: InspectionResult
     secondary_camera: str
     offset: int
+    target_frame_count: int
     rewrites: list[PlannedChange] = field(default_factory=list)
     invalidations: list[PlannedChange] = field(default_factory=list)
     skips: list[Artifact] = field(default_factory=list)

@@ -16,7 +16,7 @@ except Exception:
 from cam_align_tool.core.models import TransformKind
 
 
-def shift_video_file(src: Path, dst: Path, offset: int) -> None:
+def shift_video_file(src: Path, dst: Path, offset: int, output_frame_count: Optional[int] = None) -> None:
     if cv2 is None:
         raise RuntimeError("opencv-python is required for video rewriting.")
     cap = cv2.VideoCapture(str(src))
@@ -38,8 +38,12 @@ def shift_video_file(src: Path, dst: Path, offset: int) -> None:
         if len(frames) == 0:
             raise RuntimeError(f"No decodable frames found in video: {src}")
 
+        target_count = len(frames) if output_frame_count is None else int(output_frame_count)
+        if target_count < 0:
+            raise RuntimeError(f"Negative output frame count requested for {src}: {target_count}")
+
         shifted: list[np.ndarray] = []
-        for idx in range(len(frames)):
+        for idx in range(target_count):
             src_idx = idx + int(offset)
             if src_idx < 0:
                 src_idx = 0
@@ -80,12 +84,15 @@ def _sentinel_value(col: Any, dtype) -> Any:
     return ""
 
 
-def shift_dataframe(df: pd.DataFrame, offset: int) -> pd.DataFrame:
+def shift_dataframe(df: pd.DataFrame, offset: int, output_rows: Optional[int] = None) -> pd.DataFrame:
     if df.shape[0] == 0:
         return df.copy(deep=True)
-    out = df.copy(deep=True)
+    target_rows = df.shape[0] if output_rows is None else int(output_rows)
+    if target_rows < 0:
+        raise RuntimeError(f"Negative output row count requested: {target_rows}")
+    out = df.iloc[:target_rows].copy(deep=True)
     fill = {col: _sentinel_value(col, df[col].dtype) for col in df.columns}
-    for row in range(df.shape[0]):
+    for row in range(target_rows):
         src_row = row + int(offset)
         if 0 <= src_row < df.shape[0]:
             out.iloc[row] = df.iloc[src_row]
@@ -103,9 +110,9 @@ def _open_hdf(path: Path) -> tuple[pd.DataFrame, str]:
     return pd.read_hdf(path, key=key), key
 
 
-def shift_dataframe_h5(path: Path, dst: Path, offset: int) -> None:
+def shift_dataframe_h5(path: Path, dst: Path, offset: int, output_rows: Optional[int] = None) -> None:
     df, key = _open_hdf(path)
-    shifted = shift_dataframe(df, offset)
+    shifted = shift_dataframe(df, offset, output_rows=output_rows)
     shifted.to_hdf(str(dst), key=key, format="table", mode="w")
 
 
@@ -126,9 +133,9 @@ def _try_read_csv(path: Path) -> tuple[pd.DataFrame, Optional[list[int]]]:
     raise RuntimeError(f"Unable to parse CSV as pandas export: {path}")
 
 
-def shift_dataframe_csv(path: Path, dst: Path, offset: int) -> None:
+def shift_dataframe_csv(path: Path, dst: Path, offset: int, output_rows: Optional[int] = None) -> None:
     df, _header = _try_read_csv(path)
-    shifted = shift_dataframe(df, offset)
+    shifted = shift_dataframe(df, offset, output_rows=output_rows)
     shifted.to_csv(dst)
 
 
@@ -221,14 +228,17 @@ def shift_detected_markers_npy(path: Path, dst: Path, offset: int, frame_count: 
     np.save(dst, out.astype(arr.dtype, copy=False))
 
 
-def shift_timeseries_npy(path: Path, dst: Path, offset: int) -> None:
+def shift_timeseries_npy(path: Path, dst: Path, offset: int, output_rows: Optional[int] = None) -> None:
     arr = np.load(path)
     if arr.ndim == 0:
         raise RuntimeError(f"Scalar NPY file is not a supported timeseries transform: {path}")
     if arr.shape[0] == 0:
         np.save(dst, arr)
         return
-    out = np.empty_like(arr)
+    target_rows = arr.shape[0] if output_rows is None else int(output_rows)
+    if target_rows < 0:
+        raise RuntimeError(f"Negative output row count requested for {path}: {target_rows}")
+    out = np.empty((target_rows, *arr.shape[1:]), dtype=arr.dtype)
     if np.issubdtype(arr.dtype, np.floating):
         out[:] = np.nan
     elif np.issubdtype(arr.dtype, np.integer):
@@ -237,7 +247,7 @@ def shift_timeseries_npy(path: Path, dst: Path, offset: int) -> None:
         out[:] = False
     else:
         out[:] = 0
-    for row in range(arr.shape[0]):
+    for row in range(target_rows):
         src = row + int(offset)
         if 0 <= src < arr.shape[0]:
             out[row] = arr[src]
@@ -256,8 +266,9 @@ def verify_transform(kind: TransformKind, original: Path, candidate: Path, expec
         finally:
             cap_old.release()
             cap_new.release()
-        if old_count != new_count:
-            raise RuntimeError(f"Video frame-count mismatch after rewrite: {old_count} vs {new_count}")
+        wanted = old_count if expected_rows is None else int(expected_rows)
+        if new_count != wanted:
+            raise RuntimeError(f"Video frame-count mismatch after rewrite: {new_count} vs {wanted}")
         return
     if kind == TransformKind.DATAFRAME_H5:
         df, _key = _open_hdf(candidate)

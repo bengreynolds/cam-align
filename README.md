@@ -31,3 +31,4 @@ cam-align
 - The tool is self-contained and does not import `reachx`.
 - It is intended to be portable: copy this folder elsewhere and run it with its own environment.
 - Compensation keeps the master timeline authoritative and applies offsets only to selected secondary cameras.
+- Compensation requires the selected master/secondary pair to finish at the same frame count; when they differ by 100 frames or less, the longer side is trimmed at the end during rewrite.
