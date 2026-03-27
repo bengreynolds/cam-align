@@ -32,4 +32,5 @@ cam-align
 - It is intended to be portable: copy this folder elsewhere and run it with its own environment.
 - Compensation keeps the master timeline authoritative and applies offsets only to selected secondary cameras.
 - Compensation uses `systemdata_copy.yaml` to choose the master camera, ignores `cam3`/`stimCam`, shifts the other camera first, and then normalizes only that secondary tail to the master frame count; when a secondary timestamps file is present, it is rewritten with the same shift/length policy so downstream dropped-frame detection remains consistent.
+- Timestamp files are also inspected for in-recording dropped frames. If drops are detected, the app warns the user because this tool does not fix mid-recording hardware drops; if no drops are detected, compensation proceeds normally.
 - If the master/secondary frame-count mismatch exceeds 100 frames, the tool errors out and treats it as a significant acquisition alignment error.

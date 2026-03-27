@@ -192,15 +192,26 @@ class MainWindow(QMainWindow):
                 "Timestamp rule: the secondary timestamps file is rewritten with the same shift/length policy when present.",
                 "Detected cameras:",
                 *[
-                    f"  - {cam}: frames={info.frame_count} fps={info.fps:.2f} size={info.width}x{info.height}"
+                    (
+                        f"  - {cam}: frames={info.frame_count} fps={info.fps:.2f} size={info.width}x{info.height}"
+                        + (f" dropped_frames={len(info.dropped_frames)}" if len(info.dropped_frames) > 0 else "")
+                    )
                     for cam, info in inspection.camera_files.items()
                 ],
+                *(["", "Warnings:", *[f"  - {warning}" for warning in inspection.warnings]] if inspection.warnings else []),
                 "",
                 "Use Dry Run before executing compensation.",
             ])
         )
         self._refresh_preview()
         self._set_status("Inspection complete.")
+        if inspection.warnings:
+            QMessageBox.warning(
+                self,
+                "Dropped-frame warning",
+                "Timestamp inspection found possible in-recording dropped frames or timestamp inconsistencies.\n\n"
+                "This tool only fixes startup/end offset mismatch. Review the warning list in the summary before running compensation.",
+            )
         log_event(_LOG, "inspection_complete", root=root, master=inspection.master_camera)
 
     def _on_secondary_changed(self) -> None:
@@ -295,6 +306,11 @@ class MainWindow(QMainWindow):
             f"Invalidations: {summary.invalidate_count}\n\n"
             f"A transaction backup will be created automatically."
         )
+        if plan.inspection.warnings:
+            msg += (
+                "\n\nWarning: timestamp inspection found possible in-recording dropped frames or timestamp inconsistencies. "
+                "This tool does not repair those conditions."
+            )
         if QMessageBox.question(self, "Confirm compensation", msg) != QMessageBox.StandardButton.Yes:
             return
         self.summary_edit.clear()

@@ -37,6 +37,8 @@ class CameraFile:
     width: int
     height: int
     timestamp_path: Optional[Path] = None
+    dropped_frames: tuple[int, ...] = ()
+    inspection_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class InspectionResult:
     camera_files: dict[str, CameraFile]
     session_prefix: str
     all_files: list[Path]
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

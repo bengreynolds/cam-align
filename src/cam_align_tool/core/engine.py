@@ -277,6 +277,9 @@ def summarize_plan(plan: CompensationPlan) -> PlanSummary:
         "",
         f"Rewrite count: {len(plan.rewrites)}",
     ]
+    if plan.inspection.warnings:
+        lines.extend(["", "Warnings:"])
+        lines.extend([f"  - {warning}" for warning in plan.inspection.warnings])
     if master_rows != secondary_rows:
         direction = "trim secondary tail" if secondary_rows > master_rows else "buffer secondary tail"
         lines.insert(6, f"Post-offset length normalization: {direction} by {abs(master_rows - secondary_rows)} frame(s)")

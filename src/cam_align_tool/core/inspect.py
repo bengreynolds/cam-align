@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import yaml
 
 try:
@@ -21,6 +22,7 @@ _LEGACY_CAMS = ["sideCam", "frontCam", "fastCam"]
 _FIXED_CAMS = ["left", "right"]
 _VIDEO_EXTS = [".mp4", ".avi", ".mov", ".mkv"]
 _IGNORED_CAMERA_NAMES = {"stimcam", "cam3"}
+_SUPPORTED_FRAME_RATES = {30, 60, 90, 120, 150, 180, 200, 240}
 
 
 def _is_ignored_camera_name(name: str) -> bool:
@@ -52,13 +54,17 @@ def _session_prefix(root: Path, camera_names: Optional[list[str]] = None) -> str
     names = [p.stem for p in root.iterdir() if p.is_file() and p.suffix.lower() in _VIDEO_EXTS]
     tokens = [token for token in (camera_names or []) if token and not _is_ignored_camera_name(token)]
     tokens.extend(_LEGACY_CAMS + _FIXED_CAMS)
-    seen: set[str] = set()
+    unique_tokens: list[str] = []
+    seen_tokens: set[str] = set()
+    for token in tokens:
+        key = token.lower()
+        if key in seen_tokens:
+            continue
+        seen_tokens.add(key)
+        unique_tokens.append(token)
     for stem in sorted(names):
-        for token in tokens:
+        for token in unique_tokens:
             key = token.lower()
-            if key in seen:
-                continue
-            seen.add(key)
             idx = stem.lower().find(key)
             if idx > 0:
                 return stem[:idx]
@@ -179,6 +185,57 @@ def _video_info(path: Path) -> tuple[int, float, int, int]:
         cap.release()
 
 
+def _load_timestamp_intervals(path: Path) -> np.ndarray:
+    loaders = (
+        lambda: np.loadtxt(path, dtype="i8", usecols=(0,), delimiter=","),
+        lambda: np.loadtxt(path, dtype="i8", usecols=(0,)),
+    )
+    last_exc: Optional[Exception] = None
+    for loader in loaders:
+        try:
+            arr = np.atleast_1d(loader())
+            if arr.ndim != 1:
+                raise RuntimeError("Timestamp file did not parse as a 1D interval array")
+            return arr.astype(np.int64, copy=False)
+        except Exception as exc:
+            last_exc = exc
+    raise RuntimeError(f"Unable to parse timestamp intervals from {path}: {last_exc}")
+
+
+def _detect_dropped_frames(timestamp_path: Path, captured_frame_count: int) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    warnings: list[str] = []
+    intervals = _load_timestamp_intervals(timestamp_path)
+    if intervals.size != captured_frame_count:
+        warnings.append(
+            f"{timestamp_path.name}: timestamp row count {int(intervals.size)} does not match captured video frames {captured_frame_count}"
+        )
+    if intervals.size == 0:
+        return (), tuple(warnings)
+
+    mean_interval = float(np.mean(intervals))
+    if mean_interval <= 0:
+        warnings.append(f"{timestamp_path.name}: invalid non-positive mean timestamp interval")
+        return (), tuple(warnings)
+
+    inferred_rate = int(np.round(1.0e9 / mean_interval))
+    if inferred_rate not in _SUPPORTED_FRAME_RATES:
+        warnings.append(f"{timestamp_path.name}: inferred frame rate {inferred_rate} Hz is unusual")
+
+    nominal_interval = int(0.5 + 1.0e9 / inferred_rate)
+    interval_diffs = np.abs(intervals - nominal_interval)
+    drop_indices = np.nonzero(interval_diffs > int(nominal_interval / 2))[0]
+    n_consec = np.round(interval_diffs[drop_indices] / nominal_interval).astype(int)
+
+    dropped_frames: list[int] = []
+    n_drops = 0
+    for idx, drops_here in zip(drop_indices.tolist(), n_consec.tolist()):
+        while drops_here > 0:
+            dropped_frames.append(int(idx + 1 + n_drops))
+            n_drops += 1
+            drops_here -= 1
+    return tuple(dropped_frames), tuple(warnings)
+
+
 def inspect_input_folder(root: Path) -> InspectionResult:
     root = Path(root)
     if not root.is_dir():
@@ -205,8 +262,23 @@ def inspect_input_folder(root: Path) -> InspectionResult:
         raise RuntimeError(f"Master camera from systemdata_copy.yaml was not found among detected videos: {master}")
 
     camera_files: dict[str, CameraFile] = {}
+    warnings: list[str] = []
     for cam, video_path in videos.items():
         frame_count, fps, width, height = _video_info(video_path)
+        timestamp_path = _find_timestamp(root, prefix, cam)
+        dropped_frames: tuple[int, ...] = ()
+        camera_warnings: list[str] = []
+        if timestamp_path is not None:
+            try:
+                dropped_frames, timestamp_warnings = _detect_dropped_frames(timestamp_path, frame_count)
+                camera_warnings.extend(timestamp_warnings)
+            except Exception as exc:
+                camera_warnings.append(f"{cam}: timestamp inspection failed: {exc}")
+        if len(dropped_frames) > 0:
+            camera_warnings.append(
+                f"{cam}: detected {len(dropped_frames)} dropped frame(s) from timestamps during recording; this tool only fixes startup/end offset mismatch"
+            )
+        warnings.extend(camera_warnings)
         camera_files[cam] = CameraFile(
             camera=cam,
             video_path=video_path,
@@ -214,7 +286,9 @@ def inspect_input_folder(root: Path) -> InspectionResult:
             fps=fps,
             width=width,
             height=height,
-            timestamp_path=_find_timestamp(root, prefix, cam),
+            timestamp_path=timestamp_path,
+            dropped_frames=dropped_frames,
+            inspection_warnings=tuple(camera_warnings),
         )
 
     all_files = sorted(
@@ -231,6 +305,7 @@ def inspect_input_folder(root: Path) -> InspectionResult:
         mode=mode.value,
         master=master,
         cameras="|".join(cameras),
+        warnings=len(warnings),
     )
     return InspectionResult(
         root=root,
@@ -240,4 +315,5 @@ def inspect_input_folder(root: Path) -> InspectionResult:
         camera_files=camera_files,
         session_prefix=prefix,
         all_files=all_files,
+        warnings=tuple(warnings),
     )
