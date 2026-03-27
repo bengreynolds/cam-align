@@ -13,6 +13,7 @@ class SessionMode(str, Enum):
 
 class TransformKind(str, Enum):
     VIDEO = "video"
+    TIMESTAMPS = "timestamps"
     DATAFRAME_H5 = "dataframe_h5"
     DATAFRAME_CSV = "dataframe_csv"
     FRAME_LIST = "frame_list"

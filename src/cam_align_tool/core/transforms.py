@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar
 
 import numpy as np
 import pandas as pd
@@ -14,6 +14,8 @@ except Exception:
     cv2 = None
 
 from cam_align_tool.core.models import TransformKind
+
+T = TypeVar("T")
 
 
 def shift_video_file(src: Path, dst: Path, offset: int, output_frame_count: Optional[int] = None) -> None:
@@ -70,6 +72,58 @@ def shift_video_file(src: Path, dst: Path, offset: int, output_frame_count: Opti
         cap.release()
 
 
+def _shift_dense_rows(rows: list[T], offset: int, output_count: Optional[int], pad_row: T) -> list[T]:
+    target_count = len(rows) if output_count is None else int(output_count)
+    if target_count < 0:
+        raise RuntimeError(f"Negative output row count requested: {target_count}")
+    out: list[T] = []
+    for idx in range(target_count):
+        src_idx = idx + int(offset)
+        if 0 <= src_idx < len(rows):
+            out.append(rows[src_idx])
+        else:
+            out.append(pad_row)
+    return out
+
+
+def _split_timestamp_line(line: str) -> tuple[list[str], str]:
+    if "," in line:
+        return [part.strip() for part in line.split(",")], ","
+    return line.split(), " "
+
+
+def shift_timestamp_file(path: Path, dst: Path, offset: int, output_rows: Optional[int] = None) -> None:
+    raw_lines = [line.strip() for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+    if not raw_lines:
+        dst.write_text("", encoding="utf-8")
+        return
+
+    parsed = [_split_timestamp_line(line) for line in raw_lines]
+    cols = [parts for parts, _sep in parsed]
+    sep = parsed[0][1]
+    widths = {len(parts) for parts in cols}
+    if len(widths) != 1:
+        raise RuntimeError(f"Inconsistent timestamp row widths in {path}")
+
+    intervals: list[int] = []
+    for parts in cols:
+        try:
+            intervals.append(int(float(parts[0])))
+        except Exception as exc:
+            raise RuntimeError(f"Invalid timestamp interval in {path}: {parts[0]}") from exc
+    nominal = int(np.median(np.asarray(intervals, dtype=np.int64)))
+    if nominal <= 0:
+        raise RuntimeError(f"Unable to infer nominal timestamp interval from {path}")
+
+    pad_parts = list(cols[-1])
+    pad_parts[0] = str(nominal)
+    shifted = _shift_dense_rows(cols, offset, output_rows, pad_parts)
+    text = "\n".join(sep.join(parts) for parts in shifted)
+    if text:
+        text += "\n"
+    dst.write_text(text, encoding="utf-8")
+
+
 def _sentinel_value(col: Any, dtype) -> Any:
     parts = [str(x).lower() for x in col] if isinstance(col, tuple) else [str(col).lower()]
     name = "|".join(parts)
@@ -90,7 +144,10 @@ def shift_dataframe(df: pd.DataFrame, offset: int, output_rows: Optional[int] = 
     target_rows = df.shape[0] if output_rows is None else int(output_rows)
     if target_rows < 0:
         raise RuntimeError(f"Negative output row count requested: {target_rows}")
-    out = df.iloc[:target_rows].copy(deep=True)
+    if target_rows <= df.shape[0]:
+        out = df.iloc[:target_rows].copy(deep=True)
+    else:
+        out = df.reindex(range(target_rows)).copy(deep=True)
     fill = {col: _sentinel_value(col, df[col].dtype) for col in df.columns}
     for row in range(target_rows):
         src_row = row + int(offset)
@@ -269,6 +326,17 @@ def verify_transform(kind: TransformKind, original: Path, candidate: Path, expec
         wanted = old_count if expected_rows is None else int(expected_rows)
         if new_count != wanted:
             raise RuntimeError(f"Video frame-count mismatch after rewrite: {new_count} vs {wanted}")
+        return
+    if kind == TransformKind.TIMESTAMPS:
+        lines = [line for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+        if expected_rows is not None and len(lines) != expected_rows:
+            raise RuntimeError(f"Timestamp row-count mismatch after rewrite: {len(lines)} vs {expected_rows}")
+        if lines:
+            parts, _sep = _split_timestamp_line(lines[0])
+            try:
+                int(float(parts[0]))
+            except Exception as exc:
+                raise RuntimeError(f"Timestamp file is not parseable after rewrite: {candidate}") from exc
         return
     if kind == TransformKind.DATAFRAME_H5:
         df, _key = _open_hdf(candidate)

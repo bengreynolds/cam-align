@@ -186,8 +186,10 @@ class MainWindow(QMainWindow):
                 f"Root: {inspection.root}",
                 f"Mode: {inspection.mode.value}",
                 f"Master camera: {inspection.master_camera}",
-                "Length rule: compensation requires the selected master/secondary pair to end at the same frame count.",
-                "Auto-trim policy: the longer side is trimmed at the end when the mismatch is 100 frames or less.",
+                "Alignment rule: sideCam/master stays authoritative; the secondary is shifted first.",
+                "Length rule: after the shift, the secondary is trimmed or buffered at the tail to match the master when the mismatch is 100 frames or less.",
+                "Error rule: if the master/secondary mismatch exceeds 100 frames, the run stops as a significant acquisition alignment error.",
+                "Timestamp rule: the secondary timestamps file is rewritten with the same shift/length policy when present.",
                 "Detected cameras:",
                 *[
                     f"  - {cam}: frames={info.frame_count} fps={info.fps:.2f} size={info.width}x{info.height}"

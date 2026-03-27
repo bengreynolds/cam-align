@@ -25,6 +25,7 @@ from cam_align_tool.core.transforms import (
     shift_dataframe_h5,
     shift_frame_list_file,
     shift_scorer_output_npy,
+    shift_timestamp_file,
     shift_timeseries_npy,
     shift_video_file,
     verify_transform,
@@ -65,11 +66,12 @@ def _target_frame_count(inspection: InspectionResult, secondary_camera: str) -> 
     diff = abs(master_rows - secondary_rows)
     if diff > _MAX_AUTO_TRIM_FRAMES:
         raise RuntimeError(
-            "Master/secondary frame-count mismatch exceeds auto-trim limit: "
+            "Significant acquisition alignment error: "
             f"{inspection.master_camera}={master_rows}, {secondary_camera}={secondary_rows}, "
-            f"diff={diff}, limit={_MAX_AUTO_TRIM_FRAMES}"
+            f"diff={diff} frames exceeds allowed limit of {_MAX_AUTO_TRIM_FRAMES}. "
+            "Compensation stops instead of trimming/buffering a mismatch this large."
         )
-    return min(master_rows, secondary_rows)
+    return master_rows
 
 
 def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camera: str, target_frame_count: int) -> Artifact:
@@ -81,27 +83,22 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
     if any(name_lower.endswith(pattern.lower()) for pattern in _HIGH_RISK_PATTERNS):
         return Artifact(path=path, action=ChangeAction.INVALIDATE, reason="high_risk_fused_output")
 
-    if (
-        master_info is not None
-        and master_rows is not None
-        and master_rows > target_frame_count
-        and _norm(path) == _norm(master_info.video_path)
-    ):
-        return Artifact(
-            path=path,
-            action=ChangeAction.REWRITE,
-            reason="master_video_trim",
-            kind=TransformKind.VIDEO,
-            camera=inspection.master_camera,
-            row_count=target_frame_count,
-        )
-
     if secondary_info is not None and _norm(path) == _norm(secondary_info.video_path):
         return Artifact(
             path=path,
             action=ChangeAction.REWRITE,
             reason="secondary_video",
             kind=TransformKind.VIDEO,
+            camera=secondary_camera,
+            row_count=target_frame_count,
+        )
+
+    if secondary_info is not None and secondary_info.timestamp_path is not None and _norm(path) == _norm(secondary_info.timestamp_path):
+        return Artifact(
+            path=path,
+            action=ChangeAction.REWRITE,
+            reason="secondary_timestamps",
+            kind=TransformKind.TIMESTAMPS,
             camera=secondary_camera,
             row_count=target_frame_count,
         )
@@ -275,13 +272,14 @@ def summarize_plan(plan: CompensationPlan) -> PlanSummary:
         f"Master frames: {master_rows}",
         f"Secondary target: {plan.secondary_camera}",
         f"Secondary frames: {secondary_rows}",
-        f"Target frame count after trim: {plan.target_frame_count}",
+        f"Target secondary frame count after offset + normalize: {plan.target_frame_count}",
         f"Offset: {plan.offset} (new[t] = raw[t + offset])",
         "",
         f"Rewrite count: {len(plan.rewrites)}",
     ]
     if master_rows != secondary_rows:
-        lines.insert(6, f"Frame-count normalization: end-trim longer side by {abs(master_rows - secondary_rows)} frame(s)")
+        direction = "trim secondary tail" if secondary_rows > master_rows else "buffer secondary tail"
+        lines.insert(6, f"Post-offset length normalization: {direction} by {abs(master_rows - secondary_rows)} frame(s)")
     for item in plan.rewrites:
         lines.append(f"  REWRITE {item.artifact.kind.value}: {item.artifact.path.relative_to(plan.inspection.root)}")
     lines.append(f"Invalidate count: {len(plan.invalidations)}")
@@ -369,8 +367,9 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
             tmp_path = txn_dir / "staging" / rel
             tmp_path.parent.mkdir(parents=True, exist_ok=True)
             if artifact.kind == TransformKind.VIDEO:
-                video_offset = plan.offset if artifact.camera == plan.secondary_camera else 0
-                shift_video_file(artifact.path, tmp_path, video_offset, output_frame_count=artifact.row_count)
+                shift_video_file(artifact.path, tmp_path, plan.offset, output_frame_count=artifact.row_count)
+            elif artifact.kind == TransformKind.TIMESTAMPS:
+                shift_timestamp_file(artifact.path, tmp_path, plan.offset, output_rows=artifact.row_count)
             elif artifact.kind == TransformKind.DATAFRAME_H5:
                 shift_dataframe_h5(artifact.path, tmp_path, plan.offset, output_rows=artifact.row_count)
             elif artifact.kind == TransformKind.DATAFRAME_CSV:
