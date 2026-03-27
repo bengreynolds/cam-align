@@ -17,15 +17,21 @@ from cam_align_tool.core.models import CameraFile, InspectionResult, SessionMode
 
 _LOG = logging.getLogger("cam_align_tool.core.inspect")
 
-_LEGACY_CAMS = ["sideCam", "frontCam", "stimCam", "fastCam"]
+_LEGACY_CAMS = ["sideCam", "frontCam", "fastCam"]
 _FIXED_CAMS = ["left", "right"]
 _VIDEO_EXTS = [".mp4", ".avi", ".mov", ".mkv"]
+_IGNORED_CAMERA_NAMES = {"stimcam", "cam3"}
+
+
+def _is_ignored_camera_name(name: str) -> bool:
+    return str(name).strip().lower() in _IGNORED_CAMERA_NAMES
 
 
 def _best_video_for_camera(root: Path, camera: str) -> Optional[Path]:
+    camera_lower = camera.lower()
     candidates = [
         p for p in root.glob("*")
-        if p.is_file() and p.suffix.lower() in _VIDEO_EXTS and camera.lower() in p.name.lower()
+        if p.is_file() and p.suffix.lower() in _VIDEO_EXTS and camera_lower in p.name.lower()
     ]
     if len(candidates) == 0:
         return None
@@ -42,11 +48,18 @@ def _best_video_for_camera(root: Path, camera: str) -> Optional[Path]:
     return best or sorted(candidates)[-1]
 
 
-def _session_prefix(root: Path) -> str:
+def _session_prefix(root: Path, camera_names: Optional[list[str]] = None) -> str:
     names = [p.stem for p in root.iterdir() if p.is_file() and p.suffix.lower() in _VIDEO_EXTS]
+    tokens = [token for token in (camera_names or []) if token and not _is_ignored_camera_name(token)]
+    tokens.extend(_LEGACY_CAMS + _FIXED_CAMS)
+    seen: set[str] = set()
     for stem in sorted(names):
-        for token in _LEGACY_CAMS + _FIXED_CAMS:
-            idx = stem.lower().find(token.lower())
+        for token in tokens:
+            key = token.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            idx = stem.lower().find(key)
             if idx > 0:
                 return stem[:idx]
     return root.name + "_"
@@ -61,31 +74,91 @@ def _find_timestamp(root: Path, prefix: str, camera: str) -> Optional[Path]:
 
 
 def _camera_mode(videos: dict[str, Path]) -> SessionMode:
-    if any(cam in videos for cam in _FIXED_CAMS):
+    if any(cam.lower() in {"left", "leftcam", "right", "rightcam"} for cam in videos):
         return SessionMode.FIXED_CAM
     return SessionMode.LEGACY
 
 
+def _systemdata_path(root: Path, prefix: str) -> Optional[Path]:
+    preferred = root / f"{prefix}systemdata_copy.yaml"
+    if preferred.is_file():
+        return preferred
+    matches = sorted(root.glob("*systemdata_copy.yaml"))
+    return matches[0] if matches else None
+
+
+def _camera_configs_from_systemdata(root: Path, prefix: str) -> list[tuple[str, str, bool]]:
+    path = _systemdata_path(root, prefix)
+    if path is None:
+        return []
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, dict):
+        return []
+
+    out: list[tuple[str, str, bool]] = []
+    for cam_key, cam_cfg in raw.items():
+        if not isinstance(cam_cfg, dict):
+            continue
+        cam_key_str = str(cam_key).strip()
+        if not cam_key_str.lower().startswith("cam"):
+            continue
+        if cam_key_str.lower() == "cam3":
+            continue
+        nickname = str(cam_cfg.get("nickname", "") or "").strip()
+        if not nickname or _is_ignored_camera_name(nickname):
+            continue
+        out.append((cam_key_str, nickname, bool(cam_cfg.get("ismaster", False))))
+    return out
+
+
+def _configured_camera_names(root: Path, prefix: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for _cam_key, nickname, _is_master in _camera_configs_from_systemdata(root, prefix):
+        key = nickname.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(nickname)
+    return out
+
+
 def _master_from_systemdata(root: Path, prefix: str) -> Optional[str]:
-    candidates = [
-        root / f"{prefix}systemdata_copy.yaml",
-        root / f"{prefix}userdata_copy.yaml",
-    ]
-    for p in candidates:
-        if not p.is_file():
-            continue
-        try:
-            raw = yaml.safe_load(p.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not isinstance(raw, dict):
-            continue
-        for _, cam_cfg in raw.items():
-            if isinstance(cam_cfg, dict) and bool(cam_cfg.get("ismaster", False)):
-                nickname = str(cam_cfg.get("nickname", "") or "").strip()
-                if nickname:
-                    return nickname
+    for _cam_key, nickname, is_master in _camera_configs_from_systemdata(root, prefix):
+        if is_master:
+            return nickname
     return None
+
+
+def _fallback_camera_names(root: Path) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for cam in _LEGACY_CAMS + _FIXED_CAMS:
+        if _is_ignored_camera_name(cam):
+            continue
+        if _best_video_for_camera(root, cam) is None:
+            continue
+        key = cam.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cam)
+    return out
+
+
+def _resolve_master(videos: dict[str, Path], root: Path, prefix: str, mode: SessionMode) -> str:
+    configured_master = _master_from_systemdata(root, prefix)
+    if configured_master in videos:
+        return configured_master
+    default_master = "left" if mode == SessionMode.FIXED_CAM else "sideCam"
+    if default_master in videos:
+        return default_master
+    if len(videos) == 2:
+        return sorted(videos.keys())[0]
+    raise RuntimeError("Unable to resolve a non-cam3 master camera from systemdata_copy.yaml and detected videos.")
 
 
 def _video_info(path: Path) -> tuple[int, float, int, int]:
@@ -111,20 +184,25 @@ def inspect_input_folder(root: Path) -> InspectionResult:
     if not root.is_dir():
         raise FileNotFoundError(f"Input folder not found: {root}")
 
+    preliminary_prefix = _session_prefix(root)
+    configured_names = _configured_camera_names(root, preliminary_prefix)
+    prefix = _session_prefix(root, configured_names)
+
+    candidate_names = configured_names or _fallback_camera_names(root)
     videos: dict[str, Path] = {}
-    for cam in _LEGACY_CAMS + _FIXED_CAMS:
+    for cam in candidate_names:
+        if _is_ignored_camera_name(cam):
+            continue
         video = _best_video_for_camera(root, cam)
         if video is not None:
             videos[cam] = video
     if len(videos) < 2:
-        raise RuntimeError("Could not detect at least two camera videos in the selected folder.")
+        raise RuntimeError("Could not detect at least two non-cam3 camera videos in the selected folder.")
 
-    prefix = _session_prefix(root)
     mode = _camera_mode(videos)
-    default_master = "left" if mode == SessionMode.FIXED_CAM else "sideCam"
-    master = _master_from_systemdata(root, prefix) or default_master
+    master = _resolve_master(videos, root, prefix, mode)
     if master not in videos:
-        master = default_master if default_master in videos else sorted(videos.keys())[0]
+        raise RuntimeError(f"Master camera from systemdata_copy.yaml was not found among detected videos: {master}")
 
     camera_files: dict[str, CameraFile] = {}
     for cam, video_path in videos.items():

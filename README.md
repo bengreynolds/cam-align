@@ -31,5 +31,5 @@ cam-align
 - The tool is self-contained and does not import `reachx`.
 - It is intended to be portable: copy this folder elsewhere and run it with its own environment.
 - Compensation keeps the master timeline authoritative and applies offsets only to selected secondary cameras.
-- Compensation shifts the selected secondary first, then normalizes only the secondary tail to the master frame count; when a secondary timestamps file is present, it is rewritten with the same shift/length policy so downstream dropped-frame detection remains consistent.
+- Compensation uses `systemdata_copy.yaml` to choose the master camera, ignores `cam3`/`stimCam`, shifts the other camera first, and then normalizes only that secondary tail to the master frame count; when a secondary timestamps file is present, it is rewritten with the same shift/length policy so downstream dropped-frame detection remains consistent.
 - If the master/secondary frame-count mismatch exceeds 100 frames, the tool errors out and treats it as a significant acquisition alignment error.

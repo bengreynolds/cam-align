@@ -186,7 +186,7 @@ class MainWindow(QMainWindow):
                 f"Root: {inspection.root}",
                 f"Mode: {inspection.mode.value}",
                 f"Master camera: {inspection.master_camera}",
-                "Alignment rule: sideCam/master stays authoritative; the secondary is shifted first.",
+                "Alignment rule: the systemdata-selected master stays authoritative; the other non-cam3 camera is shifted first.",
                 "Length rule: after the shift, the secondary is trimmed or buffered at the tail to match the master when the mismatch is 100 frames or less.",
                 "Error rule: if the master/secondary mismatch exceeds 100 frames, the run stops as a significant acquisition alignment error.",
                 "Timestamp rule: the secondary timestamps file is rewritten with the same shift/length policy when present.",
