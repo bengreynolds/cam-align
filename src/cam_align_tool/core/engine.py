@@ -18,7 +18,6 @@ from cam_align_tool.core.models import (
     PlannedChange,
     TransformKind,
 )
-from cam_align_tool.core.regenerate import regenerate_hand_pellet_for_scorer
 from cam_align_tool.core.transforms import (
     atomic_replace,
     shift_detected_markers_npy,
@@ -50,6 +49,18 @@ _SHIFTABLE_FUSED_H5_PATTERNS = [
     "_pix3d.h5",
 ]
 _MAX_AUTO_TRIM_FRAMES = 100
+
+
+def _regenerate_hand_pellet_for_scorer(*args, **kwargs):
+    try:
+        from cam_align_tool.core.regenerate import regenerate_hand_pellet_for_scorer
+    except ModuleNotFoundError as exc:
+        if exc.name == "scipy":
+            raise RuntimeError(
+                "Scorer hand/pellet regeneration requires scipy, but scipy is not installed in the active environment."
+            ) from exc
+        raise
+    return regenerate_hand_pellet_for_scorer(*args, **kwargs)
 
 
 def _norm(path: Path) -> str:
@@ -462,7 +473,7 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
         generated_paths: list[str] = []
         for scorer in plan.scorer_regenerations:
             emit(f"Regenerating hand/pellet trajectories for scorer {scorer.name}")
-            for out_path in regenerate_hand_pellet_for_scorer(scorer, plan.inspection, progress=progress):
+            for out_path in _regenerate_hand_pellet_for_scorer(scorer, plan.inspection, progress=progress):
                 rel = str(out_path.relative_to(root))
                 generated_paths.append(rel)
         manifest["generated_paths"] = generated_paths
@@ -537,7 +548,7 @@ def regenerate_scorer_outputs(
         else:
             emit("Backup creation disabled; proceeding without transaction copies.")
 
-        generated_paths = regenerate_hand_pellet_for_scorer(scorer, inspection, progress=progress)
+        generated_paths = _regenerate_hand_pellet_for_scorer(scorer, inspection, progress=progress)
         generated_rel = [str(path.relative_to(root)) for path in generated_paths]
         manifest["generated_paths"] = generated_rel
         manifest["status"] = "completed"
