@@ -14,7 +14,7 @@ except Exception:
     cv2 = None
 
 from cam_align_tool.config.logging_utils import log_event
-from cam_align_tool.core.models import CameraFile, InspectionResult, SessionMode
+from cam_align_tool.core.models import CameraFile, InspectionResult, ReachEpoch, SessionMode
 
 _LOG = logging.getLogger("cam_align_tool.core.inspect")
 
@@ -76,6 +76,27 @@ def _find_timestamp(root: Path, prefix: str, camera: str) -> Optional[Path]:
     if direct.is_file():
         return direct
     matches = sorted([p for p in root.glob(f"*{camera}*_timestamps.txt") if p.is_file()])
+    return matches[0] if matches else None
+
+
+def _find_events_file(root: Path, prefix: str) -> Optional[Path]:
+    direct = root / f"{prefix}events.txt"
+    if direct.is_file():
+        return direct
+    matches = sorted([p for p in root.glob("*events.txt") if p.is_file()])
+    return matches[0] if matches else None
+
+
+def _find_reaches_file(root: Path, prefix: str) -> Optional[Path]:
+    direct = root / f"{prefix}reaches.txt"
+    if direct.is_file():
+        return direct
+    matches = sorted(
+        [
+            p for p in root.glob("*reaches.txt")
+            if p.is_file() and p.name.lower() != "detected_reaches.txt"
+        ]
+    )
     return matches[0] if matches else None
 
 
@@ -236,6 +257,79 @@ def _detect_dropped_frames(timestamp_path: Path, captured_frame_count: int) -> t
     return tuple(dropped_frames), tuple(warnings)
 
 
+def _parse_pellet_delivery_frames(events_path: Path) -> tuple[int, ...]:
+    pellet_frames: list[int] = []
+    for raw_line in events_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = re.split(r"[\t, ]+", line)
+        if len(parts) < 2:
+            continue
+        if parts[0].strip().lower() != "pellet_delivery":
+            continue
+        try:
+            pellet_frames.append(int(float(parts[1])))
+        except Exception:
+            continue
+    return tuple(pellet_frames)
+
+
+def _parse_reach_frames(reaches_path: Path) -> tuple[int, ...]:
+    reach_frames: list[int] = []
+    for raw_line in reaches_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = re.split(r"\s+", line)
+        if len(parts) < 1:
+            continue
+        try:
+            reach_frames.append(int(float(parts[0])))
+        except Exception:
+            continue
+    return tuple(reach_frames)
+
+
+def _build_reach_epochs(root: Path, prefix: str) -> tuple[tuple[ReachEpoch, ...], tuple[str, ...]]:
+    events_path = _find_events_file(root, prefix)
+    reaches_path = _find_reaches_file(root, prefix)
+    warnings: list[str] = []
+    if events_path is None:
+        if reaches_path is not None:
+            warnings.append(f"{reaches_path.name}: reaches file found but matching events.txt was not found, so pellet epoch navigation is unavailable")
+        return (), tuple(warnings)
+
+    pellet_frames = _parse_pellet_delivery_frames(events_path)
+    if len(pellet_frames) == 0:
+        warnings.append(f"{events_path.name}: no pellet_delivery entries were found, so pellet epoch navigation is unavailable")
+        return (), tuple(warnings)
+
+    reach_frames = _parse_reach_frames(reaches_path) if reaches_path is not None else ()
+    epochs: list[ReachEpoch] = []
+    for idx, pellet_frame in enumerate(pellet_frames, start=1):
+        next_pellet = pellet_frames[idx] if idx < len(pellet_frames) else None
+        if next_pellet is None:
+            epoch_reaches = tuple(frame for frame in reach_frames if frame >= pellet_frame)
+        else:
+            epoch_reaches = tuple(frame for frame in reach_frames if pellet_frame <= frame < next_pellet)
+        label = f"Epoch {idx}: pellet_delivery @ {pellet_frame}"
+        if reaches_path is not None:
+            if epoch_reaches:
+                label += f" ({len(epoch_reaches)} reach{'es' if len(epoch_reaches) != 1 else ''})"
+            else:
+                label += " (no reaches)"
+        epochs.append(
+            ReachEpoch(
+                index=idx,
+                pellet_frame=int(pellet_frame),
+                reach_frames=epoch_reaches,
+                label=label,
+            )
+        )
+    return tuple(epochs), tuple(warnings)
+
+
 def inspect_input_folder(root: Path) -> InspectionResult:
     root = Path(root)
     if not root.is_dir():
@@ -297,6 +391,8 @@ def inspect_input_folder(root: Path) -> InspectionResult:
             if p.is_file() and ".cam_align_backup" not in {part.lower() for part in p.parts}
         ]
     )
+    reach_epochs, epoch_warnings = _build_reach_epochs(root, prefix)
+    warnings.extend(epoch_warnings)
     cameras = sorted(camera_files.keys())
     log_event(
         _LOG,
@@ -306,6 +402,7 @@ def inspect_input_folder(root: Path) -> InspectionResult:
         master=master,
         cameras="|".join(cameras),
         warnings=len(warnings),
+        reach_epochs=len(reach_epochs),
     )
     return InspectionResult(
         root=root,
@@ -316,4 +413,6 @@ def inspect_input_folder(root: Path) -> InspectionResult:
         session_prefix=prefix,
         all_files=all_files,
         warnings=tuple(warnings),
+        reach_epochs=reach_epochs,
+        reaches_file_present=_find_reaches_file(root, prefix) is not None,
     )

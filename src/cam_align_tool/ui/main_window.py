@@ -82,6 +82,13 @@ class MainWindow(QMainWindow):
         self.chunk_size_spin.setRange(5, 5000)
         self.chunk_size_spin.setSingleStep(5)
         self.chunk_size_spin.setValue(50)
+        self.epoch_combo = QComboBox()
+        self.epoch_combo.setEnabled(False)
+        self.epoch_combo.addItem("No pellet epochs")
+        self.prev_epoch_btn = QPushButton("Prev Epoch")
+        self.next_epoch_btn = QPushButton("Next Epoch")
+        self.prev_epoch_btn.setEnabled(False)
+        self.next_epoch_btn.setEnabled(False)
         self.frame_label = QLabel("Frame: 0")
         self.raw_index_label = QLabel("Raw secondary idx: -")
         self.preview_index_label = QLabel("Preview secondary idx: -")
@@ -135,6 +142,14 @@ class MainWindow(QMainWindow):
         nav_row_layout.addStretch(1)
         nav_row.setLayout(nav_row_layout)
         top_form.addRow("Navigation:", nav_row)
+        epoch_row = QWidget()
+        epoch_row_layout = QHBoxLayout()
+        epoch_row_layout.setContentsMargins(0, 0, 0, 0)
+        epoch_row_layout.addWidget(self.prev_epoch_btn)
+        epoch_row_layout.addWidget(self.epoch_combo, 1)
+        epoch_row_layout.addWidget(self.next_epoch_btn)
+        epoch_row.setLayout(epoch_row_layout)
+        top_form.addRow("Pellet epochs:", epoch_row)
         top_form.addRow("", self.nav_hint_label)
         top_form.addRow("", self.raw_index_label)
         top_form.addRow("", self.preview_index_label)
@@ -193,6 +208,9 @@ class MainWindow(QMainWindow):
         self.frame_back_chunk_btn.clicked.connect(lambda: self._step_frame(-self._chunk_size()))
         self.frame_forward_chunk_btn.clicked.connect(lambda: self._step_frame(self._chunk_size()))
         self.chunk_size_spin.valueChanged.connect(self._update_chunk_button_labels)
+        self.epoch_combo.currentIndexChanged.connect(self._jump_to_selected_epoch)
+        self.prev_epoch_btn.clicked.connect(self._jump_to_prev_epoch)
+        self.next_epoch_btn.clicked.connect(self._jump_to_next_epoch)
         self.offset_spin.valueChanged.connect(self._refresh_preview)
         self.secondary_combo.currentTextChanged.connect(self._on_secondary_changed)
         self.dry_run_btn.clicked.connect(self._dry_run)
@@ -327,6 +345,59 @@ class MainWindow(QMainWindow):
     def _jump_to_end(self) -> None:
         self._set_frame_index(self._max_frame_index())
 
+    def _epoch_count(self) -> int:
+        if self._inspection is None:
+            return 0
+        return len(self._inspection.reach_epochs)
+
+    def _populate_epoch_selector(self) -> None:
+        self.epoch_combo.blockSignals(True)
+        self.epoch_combo.clear()
+        epochs = self._inspection.reach_epochs if self._inspection is not None else ()
+        if epochs:
+            self.epoch_combo.addItem("Select pellet epoch", None)
+            for epoch in epochs:
+                self.epoch_combo.addItem(epoch.label, epoch.pellet_frame)
+            self.epoch_combo.setEnabled(True)
+            self.prev_epoch_btn.setEnabled(True)
+            self.next_epoch_btn.setEnabled(True)
+            self.epoch_combo.setCurrentIndex(0)
+        else:
+            self.epoch_combo.addItem("No pellet epochs")
+            self.epoch_combo.setEnabled(False)
+            self.prev_epoch_btn.setEnabled(False)
+            self.next_epoch_btn.setEnabled(False)
+        self.epoch_combo.blockSignals(False)
+
+    def _jump_to_selected_epoch(self, index: int) -> None:
+        if self._inspection is None:
+            return
+        if index <= 0 or index > len(self._inspection.reach_epochs):
+            return
+        epoch = self._inspection.reach_epochs[index - 1]
+        self._log_ui(f"Jumping to {epoch.label}.")
+        self._set_frame_index(epoch.pellet_frame)
+
+    def _jump_to_prev_epoch(self) -> None:
+        count = self._epoch_count()
+        if count == 0:
+            return
+        current = self.epoch_combo.currentIndex()
+        if current <= 1:
+            self.epoch_combo.setCurrentIndex(1)
+            return
+        self.epoch_combo.setCurrentIndex(current - 1)
+
+    def _jump_to_next_epoch(self) -> None:
+        count = self._epoch_count()
+        if count == 0:
+            return
+        current = self.epoch_combo.currentIndex()
+        if current <= 0:
+            self.epoch_combo.setCurrentIndex(1)
+            return
+        self.epoch_combo.setCurrentIndex(min(count, current + 1))
+
     def _browse_start_dir(self) -> str:
         current = Path(self.root_edit.text().strip())
         if current.is_dir():
@@ -454,6 +525,7 @@ class MainWindow(QMainWindow):
         self.secondary_combo.blockSignals(False)
         if self._settings.last_secondary_camera in secondaries:
             self.secondary_combo.setCurrentText(self._settings.last_secondary_camera)
+        self._populate_epoch_selector()
         max_frame = max(0, inspection.camera_files[inspection.master_camera].frame_count - 1)
         self.frame_slider.setRange(0, max_frame)
         self.frame_jump_spin.blockSignals(True)
@@ -471,6 +543,16 @@ class MainWindow(QMainWindow):
                 "Length rule: after the shift, the secondary is trimmed or buffered at the tail to match the master when the mismatch is 100 frames or less.",
                 "Error rule: if the master/secondary mismatch exceeds 100 frames, the run stops as a significant acquisition alignment error.",
                 "Timestamp rule: the secondary timestamps file is rewritten with the same shift/length policy when present.",
+                (
+                    f"Pellet epoch navigation: {len(inspection.reach_epochs)} pellet-delivery epoch(s) available from events.txt."
+                    if inspection.reach_epochs
+                    else "Pellet epoch navigation: unavailable because no pellet_delivery entries were found in events.txt."
+                ),
+                (
+                    "Reach annotations: enabled from reaches.txt when present."
+                    if inspection.reaches_file_present
+                    else "Reach annotations: unavailable because reaches.txt was not found."
+                ),
                 "Detected cameras:",
                 *[
                     (

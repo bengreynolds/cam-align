@@ -61,6 +61,16 @@ class InspectionResult:
     session_prefix: str
     all_files: list[Path]
     warnings: tuple[str, ...] = ()
+    reach_epochs: tuple["ReachEpoch", ...] = ()
+    reaches_file_present: bool = False
+
+
+@dataclass(frozen=True)
+class ReachEpoch:
+    index: int
+    pellet_frame: int
+    reach_frames: tuple[int, ...] = ()
+    label: str = ""
 
 
 @dataclass(frozen=True)
