@@ -320,6 +320,18 @@ def _backup_original(root: Path, txn_dir: Path, relpath: Path) -> Path:
     return dst
 
 
+def _planned_backup_relpaths(plan: CompensationPlan) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for item in [*plan.rewrites, *plan.invalidations]:
+        key = str(item.backup_relpath).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item.backup_relpath)
+    return out
+
+
 def _find_last_completed_txn(root: Path) -> Optional[tuple[Path, dict]]:
     txn_root = _transaction_root(root)
     if not txn_root.is_dir():
@@ -340,6 +352,7 @@ def _find_last_completed_txn(root: Path) -> Optional[tuple[Path, dict]]:
 def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None]] = None) -> Path:
     root = plan.inspection.root
     txn_dir = _new_transaction_dir(root)
+    planned_backup_paths = [str(rel) for rel in _planned_backup_relpaths(plan)]
     manifest: dict = {
         "status": "in_progress",
         "created_utc": datetime.utcnow().isoformat(),
@@ -351,6 +364,8 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
         "target_frame_count": plan.target_frame_count,
         "rewrite_paths": [str(item.artifact.path.relative_to(root)) for item in plan.rewrites],
         "invalidated_paths": [str(item.artifact.path.relative_to(root)) for item in plan.invalidations],
+        "planned_backup_paths": planned_backup_paths,
+        "backed_up_paths": [],
         "restored_paths": [],
         "undone": False,
     }
@@ -362,11 +377,20 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
         log_event(_LOG, "execute_plan_progress", message=msg)
 
     try:
+        backups: dict[str, Path] = {}
+        for rel in _planned_backup_relpaths(plan):
+            backup = _backup_original(root, txn_dir, rel)
+            backups[str(rel).lower()] = backup
+            manifest["backed_up_paths"].append(str(rel))
+            write_json(_manifest_path(txn_dir), manifest)
+            emit(f"Backed up {rel}")
+        if sorted(manifest["backed_up_paths"]) != sorted(planned_backup_paths):
+            raise RuntimeError("Backup verification failed before mutation; not all planned originals were copied.")
+
         for item in plan.rewrites:
             artifact = item.artifact
             rel = item.backup_relpath
-            backup = _backup_original(root, txn_dir, rel)
-            emit(f"Backed up {rel}")
+            backup = backups[str(rel).lower()]
             tmp_path = txn_dir / "staging" / rel
             tmp_path.parent.mkdir(parents=True, exist_ok=True)
             if artifact.kind == TransformKind.VIDEO:
@@ -401,7 +425,6 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
 
         for item in plan.invalidations:
             rel = item.backup_relpath
-            _backup_original(root, txn_dir, rel)
             item.artifact.path.unlink(missing_ok=True)
             emit(f"Invalidated {rel}")
 
