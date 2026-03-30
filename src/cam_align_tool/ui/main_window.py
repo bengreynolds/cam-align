@@ -241,6 +241,12 @@ class MainWindow(QMainWindow):
         clear_ffprobe_action.triggered.connect(self._clear_ffprobe_path)
         file_menu.addAction(clear_ffprobe_action)
 
+        file_menu.addSeparator()
+
+        hotkeys_action = QAction("Hotkey Reference", self)
+        hotkeys_action.triggered.connect(self._show_hotkey_reference)
+        file_menu.addAction(hotkeys_action)
+
     def _build_shortcuts(self) -> None:
         bindings = [
             ("Left", lambda: self._step_frame(-1)),
@@ -257,6 +263,19 @@ class MainWindow(QMainWindow):
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.activated.connect(callback)
             self._shortcuts.append(shortcut)
+
+    def _show_hotkey_reference(self) -> None:
+        text = (
+            "Navigation hotkeys:\n\n"
+            "Left / Right: step by 1 frame\n"
+            "Shift+Left / Shift+Right: step by 10 frames\n"
+            "Ctrl+Left / Ctrl+Right: step by the current chunk size\n"
+            "Home / End: jump to first / last frame\n\n"
+            "Controls:\n\n"
+            "Jump to: enter an exact master-frame index and press Go\n"
+            "Chunk: sets the size used by chunk jump buttons and Ctrl+Left / Ctrl+Right"
+        )
+        QMessageBox.information(self, "Hotkey Reference", text)
 
     @staticmethod
     def _video_label() -> QLabel:
