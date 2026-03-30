@@ -16,7 +16,15 @@ _VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 _PAIRABLE_EXTS = {".csv", ".h5", ".npy", ".txt"}
 
 
-def _ffprobe_path() -> str:
+def resolve_ffprobe_path(configured_path: str = "") -> Optional[str]:
+    configured = str(configured_path or "").strip()
+    if configured:
+        candidate = Path(configured)
+        if candidate.is_file():
+            return str(candidate)
+        path = shutil.which(configured)
+        if path:
+            return path
     path = shutil.which("ffprobe")
     if path:
         return path
@@ -29,12 +37,12 @@ def _ffprobe_path() -> str:
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
-    raise RuntimeError("ffprobe was not found on PATH. Install FFmpeg so post-processing video checks can run.")
+    return None
 
 
-def _ffprobe_video_frame_count(path: Path) -> int:
+def _ffprobe_video_frame_count(path: Path, ffprobe_exe: str) -> int:
     cmd = [
-        _ffprobe_path(),
+        ffprobe_exe,
         "-v",
         "error",
         "-select_streams",
@@ -119,10 +127,12 @@ def _timestamps_row_count(path: Path) -> int:
     return sum(1 for _ in path.open("r", encoding="utf-8", errors="replace"))
 
 
-def _dense_length_for_path(path: Path) -> int:
+def _dense_length_for_path(path: Path, ffprobe_exe: Optional[str]) -> int:
     name_lower = path.name.lower()
     if path.suffix.lower() in _VIDEO_EXTS:
-        return _ffprobe_video_frame_count(path)
+        if ffprobe_exe:
+            return _ffprobe_video_frame_count(path, ffprobe_exe)
+        return _cv2_video_frame_count(path)
     if name_lower.endswith("_timestamps.txt"):
         return _timestamps_row_count(path)
     if path.suffix.lower() == ".csv":
@@ -176,7 +186,8 @@ def _paired_dense_artifacts(inspection: InspectionResult, secondary_camera: str)
 
 
 def run_post_process_check(inspection: InspectionResult, secondary_camera: str,
-                           progress: Optional[Callable[[str], None]] = None) -> PostCheckReport:
+                           progress: Optional[Callable[[str], None]] = None,
+                           ffprobe_path: str = "") -> PostCheckReport:
     if secondary_camera == inspection.master_camera:
         raise RuntimeError("Post-processing check requires a secondary camera.")
     if secondary_camera not in inspection.camera_files:
@@ -195,26 +206,35 @@ def run_post_process_check(inspection: InspectionResult, secondary_camera: str,
         "",
     ]
     failures: list[str] = []
+    ffprobe_exe = resolve_ffprobe_path(ffprobe_path)
 
     master_video = inspection.camera_files[master].video_path
     secondary_video = inspection.camera_files[secondary_camera].video_path
-    emit("Checking video lengths with ffprobe and OpenCV.")
-    master_ffprobe = _ffprobe_video_frame_count(master_video)
-    secondary_ffprobe = _ffprobe_video_frame_count(secondary_video)
+    emit("Checking video lengths with OpenCV and ffprobe when available.")
     lines.append("Video checks:")
-    lines.append(f"  - ffprobe frame counts: {master_video.name}={master_ffprobe}, {secondary_video.name}={secondary_ffprobe}")
-    if master_ffprobe != secondary_ffprobe:
-        failures.append(f"Video frame count mismatch: {master_ffprobe} vs {secondary_ffprobe}")
+    if ffprobe_exe:
+        master_ffprobe = _ffprobe_video_frame_count(master_video, ffprobe_exe)
+        secondary_ffprobe = _ffprobe_video_frame_count(secondary_video, ffprobe_exe)
+        lines.append(f"  - ffprobe path: {ffprobe_exe}")
+        lines.append(f"  - ffprobe frame counts: {master_video.name}={master_ffprobe}, {secondary_video.name}={secondary_ffprobe}")
+        if master_ffprobe != secondary_ffprobe:
+            failures.append(f"Video frame count mismatch: {master_ffprobe} vs {secondary_ffprobe}")
+    else:
+        master_ffprobe = None
+        secondary_ffprobe = None
+        lines.append("  - ffprobe checks skipped: executable not found.")
 
     master_cv2 = _cv2_video_frame_count(master_video)
     secondary_cv2 = _cv2_video_frame_count(secondary_video)
     lines.append(f"  - OpenCV frame counts: {master_video.name}={master_cv2}, {secondary_video.name}={secondary_cv2}")
-    if master_cv2 != master_ffprobe:
+    if master_cv2 != secondary_cv2:
+        failures.append(f"Video frame count mismatch via OpenCV: {master_cv2} vs {secondary_cv2}")
+    if master_ffprobe is not None and master_cv2 != master_ffprobe:
         failures.append(f"OpenCV/ffprobe mismatch for {master_video.name}: {master_cv2} vs {master_ffprobe}")
-    if secondary_cv2 != secondary_ffprobe:
+    if secondary_ffprobe is not None and secondary_cv2 != secondary_ffprobe:
         failures.append(f"OpenCV/ffprobe mismatch for {secondary_video.name}: {secondary_cv2} vs {secondary_ffprobe}")
 
-    sample_count = min(master_ffprobe, secondary_ffprobe)
+    sample_count = min(master_cv2, secondary_cv2)
     sample_indices = sorted({0, max(0, sample_count // 2), max(0, sample_count - 1)}) if sample_count > 0 else []
     if sample_indices:
         master_reads = _cv2_sample_read_ok(master_video, sample_indices)
@@ -231,8 +251,8 @@ def run_post_process_check(inspection: InspectionResult, secondary_camera: str,
     pair_found = False
     for master_path, secondary_path in _paired_dense_artifacts(inspection, secondary_camera):
         pair_found = True
-        master_len = _dense_length_for_path(master_path)
-        secondary_len = _dense_length_for_path(secondary_path)
+        master_len = _dense_length_for_path(master_path, ffprobe_exe)
+        secondary_len = _dense_length_for_path(secondary_path, ffprobe_exe)
         rel_master = master_path.relative_to(inspection.root)
         rel_secondary = secondary_path.relative_to(inspection.root)
         ok = master_len == secondary_len

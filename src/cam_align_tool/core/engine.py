@@ -349,10 +349,11 @@ def _find_last_completed_txn(root: Path) -> Optional[tuple[Path, dict]]:
     return None
 
 
-def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None]] = None) -> Path:
+def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None]] = None,
+                 create_backup: bool = True) -> Path:
     root = plan.inspection.root
     txn_dir = _new_transaction_dir(root)
-    planned_backup_paths = [str(rel) for rel in _planned_backup_relpaths(plan)]
+    planned_backup_paths = [str(rel) for rel in _planned_backup_relpaths(plan)] if create_backup else []
     manifest: dict = {
         "status": "in_progress",
         "created_utc": datetime.utcnow().isoformat(),
@@ -362,6 +363,7 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
         "secondary_camera": plan.secondary_camera,
         "offset": plan.offset,
         "target_frame_count": plan.target_frame_count,
+        "backup_enabled": bool(create_backup),
         "rewrite_paths": [str(item.artifact.path.relative_to(root)) for item in plan.rewrites],
         "invalidated_paths": [str(item.artifact.path.relative_to(root)) for item in plan.invalidations],
         "planned_backup_paths": planned_backup_paths,
@@ -378,19 +380,22 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
 
     try:
         backups: dict[str, Path] = {}
-        for rel in _planned_backup_relpaths(plan):
-            backup = _backup_original(root, txn_dir, rel)
-            backups[str(rel).lower()] = backup
-            manifest["backed_up_paths"].append(str(rel))
-            write_json(_manifest_path(txn_dir), manifest)
-            emit(f"Backed up {rel}")
-        if sorted(manifest["backed_up_paths"]) != sorted(planned_backup_paths):
-            raise RuntimeError("Backup verification failed before mutation; not all planned originals were copied.")
+        if create_backup:
+            for rel in _planned_backup_relpaths(plan):
+                backup = _backup_original(root, txn_dir, rel)
+                backups[str(rel).lower()] = backup
+                manifest["backed_up_paths"].append(str(rel))
+                write_json(_manifest_path(txn_dir), manifest)
+                emit(f"Backed up {rel}")
+            if sorted(manifest["backed_up_paths"]) != sorted(planned_backup_paths):
+                raise RuntimeError("Backup verification failed before mutation; not all planned originals were copied.")
+        else:
+            emit("Backup creation disabled; proceeding without transaction copies.")
 
         for item in plan.rewrites:
             artifact = item.artifact
             rel = item.backup_relpath
-            backup = backups[str(rel).lower()]
+            source_for_verify = backups[str(rel).lower()] if create_backup else artifact.path
             tmp_path = txn_dir / "staging" / rel
             tmp_path.parent.mkdir(parents=True, exist_ok=True)
             if artifact.kind == TransformKind.VIDEO:
@@ -419,7 +424,7 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
                 shift_timeseries_npy(artifact.path, tmp_path, plan.offset, output_rows=artifact.row_count)
             else:
                 raise RuntimeError(f"Unhandled rewrite kind: {artifact.kind}")
-            verify_transform(artifact.kind, backup, tmp_path, artifact.row_count)
+            verify_transform(artifact.kind, source_for_verify, tmp_path, artifact.row_count)
             atomic_replace(tmp_path, artifact.path)
             emit(f"Rewrote {rel}")
 
@@ -433,8 +438,17 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
         emit(f"Completed transaction {txn_dir.name}")
         return _manifest_path(txn_dir)
     except Exception as exc:
-        emit(f"Failure encountered, rolling back: {exc}")
-        rollback_transaction(root, txn_dir, manifest=manifest, progress=progress, error=str(exc))
+        if create_backup:
+            emit(f"Failure encountered, rolling back: {exc}")
+            rollback_transaction(root, txn_dir, manifest=manifest, progress=progress, error=str(exc))
+        else:
+            emit(f"Failure encountered with backups disabled; rollback unavailable: {exc}")
+            staging_root = txn_dir / "staging"
+            if staging_root.exists():
+                shutil.rmtree(staging_root, ignore_errors=True)
+            manifest["status"] = "failed_no_backup"
+            manifest["rollback_error"] = str(exc)
+            write_json(_manifest_path(txn_dir), manifest)
         raise
 
 
@@ -475,6 +489,8 @@ def undo_last_transaction(root: Path, progress: Optional[Callable[[str], None]] 
     if found is None:
         raise RuntimeError("No completed compensation transaction available to undo.")
     txn_dir, manifest = found
+    if not manifest.get("backup_enabled", True):
+        raise RuntimeError("The most recent completed compensation was run with backup creation disabled, so undo is unavailable.")
     rollback_transaction(root, txn_dir, manifest=manifest, progress=progress, error="undo")
     manifest = json.loads(_manifest_path(txn_dir).read_text(encoding="utf-8"))
     manifest["status"] = "undone"

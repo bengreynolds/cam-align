@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -47,9 +47,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("cam-align")
         self.resize(1680, 920)
         self._build_ui()
-        self.root_edit.setText(settings.last_root)
         self.offset_spin.setValue(settings.last_offset)
-        self._set_status("Select a session/raw folder and inspect it.")
+        self.root_edit.setText(settings.last_root)
+        self._set_status("Select a session/raw folder; it will inspect immediately.")
+        if settings.last_root and Path(settings.last_root).is_dir():
+            self._inspect_root()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -57,7 +59,6 @@ class MainWindow(QMainWindow):
 
         self.root_edit = QLineEdit()
         self.root_browse_btn = QPushButton("Browse...")
-        self.inspect_btn = QPushButton("Inspect Folder")
         self.master_label = QLabel("-")
         self.mode_label = QLabel("-")
         self.secondary_combo = QComboBox()
@@ -83,7 +84,6 @@ class MainWindow(QMainWindow):
         root_row_layout.setContentsMargins(0, 0, 0, 0)
         root_row_layout.addWidget(self.root_edit, 1)
         root_row_layout.addWidget(self.root_browse_btn)
-        root_row_layout.addWidget(self.inspect_btn)
         root_row.setLayout(root_row_layout)
         top_form.addRow("Input folder:", root_row)
         top_form.addRow("Mode:", self.mode_label)
@@ -141,9 +141,11 @@ class MainWindow(QMainWindow):
 
         central.setLayout(outer)
         self.setCentralWidget(central)
+        self._build_menu()
 
         self.root_browse_btn.clicked.connect(self._browse_root)
-        self.inspect_btn.clicked.connect(self._inspect_root)
+        self.root_edit.returnPressed.connect(self._load_root_from_edit)
+        self.root_edit.editingFinished.connect(self._load_root_from_edit)
         self.frame_slider.valueChanged.connect(self._refresh_preview)
         self.offset_spin.valueChanged.connect(self._refresh_preview)
         self.secondary_combo.currentTextChanged.connect(self._on_secondary_changed)
@@ -151,6 +153,45 @@ class MainWindow(QMainWindow):
         self.run_btn.clicked.connect(self._run_compensation)
         self.post_check_btn.clicked.connect(self._post_process_check)
         self.undo_btn.clicked.connect(self._undo_last)
+
+    def _build_menu(self) -> None:
+        file_menu = self.menuBar().addMenu("&File")
+
+        browse_action = QAction("Browse Session...", self)
+        browse_action.triggered.connect(self._browse_root)
+        file_menu.addAction(browse_action)
+
+        reload_action = QAction("Reload Session", self)
+        reload_action.triggered.connect(self._reload_current_root)
+        file_menu.addAction(reload_action)
+
+        file_menu.addSeparator()
+
+        self.backup_action = QAction("Create Transaction Backup", self)
+        self.backup_action.setCheckable(True)
+        self.backup_action.setChecked(bool(self._settings.create_backup))
+        self.backup_action.toggled.connect(self._on_backup_toggled)
+        file_menu.addAction(self.backup_action)
+
+        self.auto_post_check_action = QAction("Auto-Run Post-Process Check", self)
+        self.auto_post_check_action.setCheckable(True)
+        self.auto_post_check_action.setChecked(bool(self._settings.auto_post_check))
+        self.auto_post_check_action.toggled.connect(self._on_auto_post_check_toggled)
+        file_menu.addAction(self.auto_post_check_action)
+
+        file_menu.addSeparator()
+
+        default_root_action = QAction("Set Default Browse Root...", self)
+        default_root_action.triggered.connect(self._select_default_browse_root)
+        file_menu.addAction(default_root_action)
+
+        ffprobe_action = QAction("Set ffprobe Path...", self)
+        ffprobe_action.triggered.connect(self._select_ffprobe_path)
+        file_menu.addAction(ffprobe_action)
+
+        clear_ffprobe_action = QAction("Clear ffprobe Path", self)
+        clear_ffprobe_action.triggered.connect(self._clear_ffprobe_path)
+        file_menu.addAction(clear_ffprobe_action)
 
     @staticmethod
     def _video_label() -> QLabel:
@@ -160,10 +201,89 @@ class MainWindow(QMainWindow):
         out.setStyleSheet("background-color: #101010; color: #f5f5f5;")
         return out
 
+    def _save_settings(self) -> None:
+        save_settings(self._settings)
+
+    def _browse_start_dir(self) -> str:
+        current = Path(self.root_edit.text().strip())
+        if current.is_dir():
+            return str(current)
+        configured = Path(self._settings.default_browse_root.strip())
+        if self._settings.default_browse_root and configured.is_dir():
+            return str(configured)
+        return str(Path.cwd())
+
     def _browse_root(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, "Select session/raw folder", self.root_edit.text().strip())
+        chosen = QFileDialog.getExistingDirectory(self, "Select session/raw folder", self._browse_start_dir())
         if chosen:
-            self.root_edit.setText(chosen)
+            self._set_root_path(chosen)
+
+    def _set_root_path(self, root_text: str, reset_log: bool = True) -> None:
+        root = Path(root_text).expanduser()
+        self.root_edit.setText(str(root))
+        self._settings.last_root = str(root)
+        self._save_settings()
+        if root.is_dir():
+            self._inspect_root(reset_log=reset_log)
+        else:
+            self._set_status(f"Selected folder does not exist: {root}")
+
+    def _load_root_from_edit(self) -> None:
+        root_text = self.root_edit.text().strip()
+        if not root_text:
+            return
+        root = Path(root_text).expanduser()
+        if self._inspection is not None and root == self._inspection.root:
+            return
+        self._set_root_path(root_text)
+
+    def _reload_current_root(self) -> None:
+        root_text = self.root_edit.text().strip()
+        if not root_text:
+            QMessageBox.information(self, "Reload unavailable", "Select a valid folder first.")
+            return
+        root = Path(root_text).expanduser()
+        if not root.is_dir():
+            QMessageBox.information(self, "Reload unavailable", "Select a valid folder first.")
+            return
+        self._inspect_root()
+
+    def _select_default_browse_root(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Select default session browse root", self._browse_start_dir())
+        if not chosen:
+            return
+        self._settings.default_browse_root = chosen
+        self._save_settings()
+        self._log_ui(f"Default browse root set to {chosen}")
+
+    def _select_ffprobe_path(self) -> None:
+        initial = self._settings.ffprobe_path.strip() or self._browse_start_dir()
+        chosen, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select ffprobe executable",
+            initial,
+            "Executables (*.exe *.bat *.cmd);;All files (*)",
+        )
+        if not chosen:
+            return
+        self._settings.ffprobe_path = chosen
+        self._save_settings()
+        self._log_ui(f"ffprobe path set to {chosen}")
+
+    def _clear_ffprobe_path(self) -> None:
+        self._settings.ffprobe_path = ""
+        self._save_settings()
+        self._log_ui("ffprobe path cleared; automatic search will be used.")
+
+    def _on_backup_toggled(self, checked: bool) -> None:
+        self._settings.create_backup = bool(checked)
+        self._save_settings()
+        self._log_ui(f"Create Transaction Backup set to {self._settings.create_backup}.")
+
+    def _on_auto_post_check_toggled(self, checked: bool) -> None:
+        self._settings.auto_post_check = bool(checked)
+        self._save_settings()
+        self._log_ui(f"Auto-Run Post-Process Check set to {self._settings.auto_post_check}.")
 
     @staticmethod
     def _log_stamp() -> str:
@@ -199,6 +319,8 @@ class MainWindow(QMainWindow):
             return
         self._inspection = inspection
         self._plan = None
+        self._settings.last_root = str(inspection.root)
+        self._save_settings()
         self._log_ui(f"Inspection succeeded. Master={inspection.master_camera}; cameras={', '.join(inspection.cameras)}")
         self.mode_label.setText(inspection.mode.value)
         self.master_label.setText(inspection.master_camera)
@@ -348,8 +470,13 @@ class MainWindow(QMainWindow):
             f"Offset: {plan.offset}\n"
             f"Rewrites: {summary.rewrite_count}\n"
             f"Invalidations: {summary.invalidate_count}\n\n"
-            f"A transaction backup will be created automatically."
         )
+        if self._settings.create_backup:
+            msg += "A transaction backup will be created automatically."
+        else:
+            msg += "Backup creation is disabled. Files will be changed in place and undo may not be available."
+            if summary.invalidate_count > 0:
+                msg += "\n\nWarning: this run will invalidate derived files without creating a restorable backup."
         if plan.inspection.warnings:
             self._log_ui("Plan contains inspection warnings; run confirmation will include them.")
             msg += (
@@ -361,7 +488,7 @@ class MainWindow(QMainWindow):
             return
         self._start_log("Executing compensation")
         try:
-            manifest_path = execute_plan(plan, progress=self._append_summary)
+            manifest_path = execute_plan(plan, progress=self._append_summary, create_backup=self._settings.create_backup)
         except Exception as exc:
             self._log_ui(f"Compensation failed: {exc}")
             QMessageBox.critical(self, "Compensation failed", str(exc))
@@ -371,8 +498,11 @@ class MainWindow(QMainWindow):
         self._set_status("Compensation completed successfully.")
         self._log_ui("Refreshing inspection after compensation.")
         self._inspect_root(reset_log=False)
+        if self._settings.auto_post_check and self._inspection is not None:
+            self._log_ui("Auto post-process check is enabled; running verification now.")
+            self._post_process_check(reset_log=False)
 
-    def _post_process_check(self) -> None:
+    def _post_process_check(self, reset_log: bool = True) -> None:
         if self._inspection is None:
             QMessageBox.information(self, "Post-process check unavailable", "Inspect a folder first.")
             return
@@ -380,9 +510,17 @@ class MainWindow(QMainWindow):
         if not secondary:
             QMessageBox.information(self, "Post-process check unavailable", "Choose a secondary camera first.")
             return
-        self._start_log(f"Starting post-process check for {secondary}")
+        if reset_log:
+            self._start_log(f"Starting post-process check for {secondary}")
+        else:
+            self._log_ui(f"Starting post-process check for {secondary}")
         try:
-            report = run_post_process_check(self._inspection, secondary, progress=self._append_summary)
+            report = run_post_process_check(
+                self._inspection,
+                secondary,
+                progress=self._append_summary,
+                ffprobe_path=self._settings.ffprobe_path,
+            )
         except Exception as exc:
             self._log_ui(f"Post-process check failed: {exc}")
             QMessageBox.critical(self, "Post-process check failed", str(exc))
@@ -430,6 +568,6 @@ class MainWindow(QMainWindow):
         self._settings.last_root = self.root_edit.text().strip()
         self._settings.last_secondary_camera = self.secondary_combo.currentText().strip()
         self._settings.last_offset = int(self.offset_spin.value())
-        save_settings(self._settings)
+        self._save_settings()
         self._video_provider.clear()
         super().closeEvent(event)
