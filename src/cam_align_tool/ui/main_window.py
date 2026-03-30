@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QPixmap
+from PySide6.QtGui import QAction, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -67,11 +67,28 @@ class MainWindow(QMainWindow):
         self.offset_spin.setSingleStep(1)
         self.frame_slider = QSlider(Qt.Orientation.Horizontal)
         self.frame_slider.setRange(0, 0)
+        self.frame_jump_spin = QSpinBox()
+        self.frame_jump_spin.setRange(0, 0)
+        self.frame_jump_spin.setKeyboardTracking(False)
+        self.frame_jump_spin.setPrefix("#")
+        self.frame_go_btn = QPushButton("Go")
+        self.frame_back_chunk_btn = QPushButton("-50")
+        self.frame_back_fast_btn = QPushButton("-10")
+        self.frame_back_one_btn = QPushButton("-1")
+        self.frame_forward_one_btn = QPushButton("+1")
+        self.frame_forward_fast_btn = QPushButton("+10")
+        self.frame_forward_chunk_btn = QPushButton("+50")
+        self.chunk_size_spin = QSpinBox()
+        self.chunk_size_spin.setRange(5, 5000)
+        self.chunk_size_spin.setSingleStep(5)
+        self.chunk_size_spin.setValue(50)
         self.frame_label = QLabel("Frame: 0")
         self.raw_index_label = QLabel("Raw secondary idx: -")
         self.preview_index_label = QLabel("Preview secondary idx: -")
         self.sign_label = QLabel("Offset convention: compensated[t] = raw[t + offset]")
         self.sign_label.setStyleSheet("color: #b71c1c; font-weight: 600;")
+        self.nav_hint_label = QLabel("Hotkeys: Left/Right=1, Shift+Left/Right=10, Ctrl+Left/Right=chunk, Home/End=start/end")
+        self.nav_hint_label.setStyleSheet("color: #455a64;")
 
         self.dry_run_btn = QPushButton("Dry Run")
         self.run_btn = QPushButton("Run Offset Compensation")
@@ -99,6 +116,26 @@ class MainWindow(QMainWindow):
         frame_row_layout.addWidget(self.frame_label)
         frame_row.setLayout(frame_row_layout)
         top_form.addRow("Master frame:", frame_row)
+        nav_row = QWidget()
+        nav_row_layout = QHBoxLayout()
+        nav_row_layout.setContentsMargins(0, 0, 0, 0)
+        nav_row_layout.addWidget(self.frame_back_chunk_btn)
+        nav_row_layout.addWidget(self.frame_back_fast_btn)
+        nav_row_layout.addWidget(self.frame_back_one_btn)
+        nav_row_layout.addWidget(self.frame_forward_one_btn)
+        nav_row_layout.addWidget(self.frame_forward_fast_btn)
+        nav_row_layout.addWidget(self.frame_forward_chunk_btn)
+        nav_row_layout.addSpacing(12)
+        nav_row_layout.addWidget(QLabel("Jump to:"))
+        nav_row_layout.addWidget(self.frame_jump_spin)
+        nav_row_layout.addWidget(self.frame_go_btn)
+        nav_row_layout.addSpacing(12)
+        nav_row_layout.addWidget(QLabel("Chunk:"))
+        nav_row_layout.addWidget(self.chunk_size_spin)
+        nav_row_layout.addStretch(1)
+        nav_row.setLayout(nav_row_layout)
+        top_form.addRow("Navigation:", nav_row)
+        top_form.addRow("", self.nav_hint_label)
         top_form.addRow("", self.raw_index_label)
         top_form.addRow("", self.preview_index_label)
 
@@ -147,12 +184,23 @@ class MainWindow(QMainWindow):
         self.root_edit.returnPressed.connect(self._load_root_from_edit)
         self.root_edit.editingFinished.connect(self._load_root_from_edit)
         self.frame_slider.valueChanged.connect(self._refresh_preview)
+        self.frame_jump_spin.valueChanged.connect(self._jump_to_frame)
+        self.frame_go_btn.clicked.connect(self._jump_to_entered_frame)
+        self.frame_back_one_btn.clicked.connect(lambda: self._step_frame(-1))
+        self.frame_forward_one_btn.clicked.connect(lambda: self._step_frame(1))
+        self.frame_back_fast_btn.clicked.connect(lambda: self._step_frame(-10))
+        self.frame_forward_fast_btn.clicked.connect(lambda: self._step_frame(10))
+        self.frame_back_chunk_btn.clicked.connect(lambda: self._step_frame(-self._chunk_size()))
+        self.frame_forward_chunk_btn.clicked.connect(lambda: self._step_frame(self._chunk_size()))
+        self.chunk_size_spin.valueChanged.connect(self._update_chunk_button_labels)
         self.offset_spin.valueChanged.connect(self._refresh_preview)
         self.secondary_combo.currentTextChanged.connect(self._on_secondary_changed)
         self.dry_run_btn.clicked.connect(self._dry_run)
         self.run_btn.clicked.connect(self._run_compensation)
         self.post_check_btn.clicked.connect(self._post_process_check)
         self.undo_btn.clicked.connect(self._undo_last)
+        self._build_shortcuts()
+        self._update_chunk_button_labels()
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -193,6 +241,23 @@ class MainWindow(QMainWindow):
         clear_ffprobe_action.triggered.connect(self._clear_ffprobe_path)
         file_menu.addAction(clear_ffprobe_action)
 
+    def _build_shortcuts(self) -> None:
+        bindings = [
+            ("Left", lambda: self._step_frame(-1)),
+            ("Right", lambda: self._step_frame(1)),
+            ("Shift+Left", lambda: self._step_frame(-10)),
+            ("Shift+Right", lambda: self._step_frame(10)),
+            ("Ctrl+Left", lambda: self._step_frame(-self._chunk_size())),
+            ("Ctrl+Right", lambda: self._step_frame(self._chunk_size())),
+            ("Home", self._jump_to_start),
+            ("End", self._jump_to_end),
+        ]
+        self._shortcuts: list[QShortcut] = []
+        for sequence, callback in bindings:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(callback)
+            self._shortcuts.append(shortcut)
+
     @staticmethod
     def _video_label() -> QLabel:
         out = QLabel("No preview.")
@@ -203,6 +268,45 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self) -> None:
         save_settings(self._settings)
+
+    def _max_frame_index(self) -> int:
+        return int(self.frame_slider.maximum())
+
+    def _chunk_size(self) -> int:
+        return int(self.chunk_size_spin.value())
+
+    def _update_chunk_button_labels(self) -> None:
+        chunk = self._chunk_size()
+        self.frame_back_chunk_btn.setText(f"-{chunk}")
+        self.frame_forward_chunk_btn.setText(f"+{chunk}")
+        self.frame_slider.setSingleStep(1)
+        self.frame_slider.setPageStep(chunk)
+
+    def _set_frame_index(self, frame_index: int) -> None:
+        bounded = max(0, min(int(frame_index), self._max_frame_index()))
+        if bounded == int(self.frame_slider.value()):
+            self._refresh_preview()
+            return
+        self.frame_slider.setValue(bounded)
+
+    def _step_frame(self, delta: int) -> None:
+        if self._inspection is None:
+            return
+        self._set_frame_index(int(self.frame_slider.value()) + int(delta))
+
+    def _jump_to_frame(self, frame_index: int) -> None:
+        if self._inspection is None:
+            return
+        self._set_frame_index(frame_index)
+
+    def _jump_to_entered_frame(self) -> None:
+        self._jump_to_frame(int(self.frame_jump_spin.value()))
+
+    def _jump_to_start(self) -> None:
+        self._set_frame_index(0)
+
+    def _jump_to_end(self) -> None:
+        self._set_frame_index(self._max_frame_index())
 
     def _browse_start_dir(self) -> str:
         current = Path(self.root_edit.text().strip())
@@ -331,7 +435,12 @@ class MainWindow(QMainWindow):
         self.secondary_combo.blockSignals(False)
         if self._settings.last_secondary_camera in secondaries:
             self.secondary_combo.setCurrentText(self._settings.last_secondary_camera)
-        self.frame_slider.setRange(0, max(0, inspection.camera_files[inspection.master_camera].frame_count - 1))
+        max_frame = max(0, inspection.camera_files[inspection.master_camera].frame_count - 1)
+        self.frame_slider.setRange(0, max_frame)
+        self.frame_jump_spin.blockSignals(True)
+        self.frame_jump_spin.setRange(0, max_frame)
+        self.frame_jump_spin.setValue(min(int(self.frame_slider.value()), max_frame))
+        self.frame_jump_spin.blockSignals(False)
         self._video_provider.set_paths({cam: info.video_path for cam, info in inspection.camera_files.items()})
         self._log_report(
             "Inspection summary",
@@ -396,6 +505,9 @@ class MainWindow(QMainWindow):
         frame_index = int(self.frame_slider.value())
         preview_index = frame_index + int(self.offset_spin.value())
         raw_index = frame_index
+        self.frame_jump_spin.blockSignals(True)
+        self.frame_jump_spin.setValue(frame_index)
+        self.frame_jump_spin.blockSignals(False)
         self.frame_label.setText(f"Frame: {frame_index}")
         self.raw_index_label.setText(f"Raw secondary idx: {raw_index}")
         self.preview_index_label.setText(f"Preview secondary idx: {preview_index}")
