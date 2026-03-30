@@ -86,3 +86,9 @@ class PlanSummary:
     invalidate_count: int
     skip_count: int
     details: str
+
+
+@dataclass(frozen=True)
+class PostCheckReport:
+    passed: bool
+    details: str

@@ -29,6 +29,7 @@ from cam_align_tool.config.settings import AppSettings, save_settings
 from cam_align_tool.core.engine import execute_plan, inspect_and_plan, summarize_plan, undo_last_transaction
 from cam_align_tool.core.inspect import inspect_input_folder
 from cam_align_tool.core.models import CompensationPlan, InspectionResult
+from cam_align_tool.core.postcheck import run_post_process_check
 from cam_align_tool.ui.video_provider import VideoProvider
 
 _LOG = logging.getLogger("cam_align_tool.ui.main_window")
@@ -72,6 +73,7 @@ class MainWindow(QMainWindow):
 
         self.dry_run_btn = QPushButton("Dry Run")
         self.run_btn = QPushButton("Run Offset Compensation")
+        self.post_check_btn = QPushButton("Post-Process Check")
         self.undo_btn = QPushButton("Undo Last Compensation")
 
         top_form = QFormLayout()
@@ -104,6 +106,7 @@ class MainWindow(QMainWindow):
         actions_layout.setContentsMargins(0, 0, 0, 0)
         actions_layout.addWidget(self.dry_run_btn)
         actions_layout.addWidget(self.run_btn)
+        actions_layout.addWidget(self.post_check_btn)
         actions_layout.addWidget(self.undo_btn)
         actions_layout.addStretch(1)
         actions.setLayout(actions_layout)
@@ -145,6 +148,7 @@ class MainWindow(QMainWindow):
         self.secondary_combo.currentTextChanged.connect(self._on_secondary_changed)
         self.dry_run_btn.clicked.connect(self._dry_run)
         self.run_btn.clicked.connect(self._run_compensation)
+        self.post_check_btn.clicked.connect(self._post_process_check)
         self.undo_btn.clicked.connect(self._undo_last)
 
     @staticmethod
@@ -323,6 +327,29 @@ class MainWindow(QMainWindow):
         self._append_summary(f"Manifest written: {manifest_path}")
         self._set_status("Compensation completed successfully.")
         self._inspect_root()
+
+    def _post_process_check(self) -> None:
+        if self._inspection is None:
+            QMessageBox.information(self, "Post-process check unavailable", "Inspect a folder first.")
+            return
+        secondary = self.secondary_combo.currentText().strip()
+        if not secondary:
+            QMessageBox.information(self, "Post-process check unavailable", "Choose a secondary camera first.")
+            return
+        self.summary_edit.clear()
+        try:
+            report = run_post_process_check(self._inspection, secondary, progress=self._append_summary)
+        except Exception as exc:
+            QMessageBox.critical(self, "Post-process check failed", str(exc))
+            self._set_status(f"Post-process check failed: {exc}")
+            return
+        self.summary_edit.setPlainText(report.details)
+        if report.passed:
+            self._set_status("Post-process check passed.")
+            QMessageBox.information(self, "Post-process check", "All checked dense pairs matched.")
+        else:
+            self._set_status("Post-process check found mismatches.")
+            QMessageBox.warning(self, "Post-process check", "One or more checked dense pairs did not match. Review the report.")
 
     def _undo_last(self) -> None:
         root = Path(self.root_edit.text().strip())
