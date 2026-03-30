@@ -18,6 +18,7 @@ from cam_align_tool.core.models import (
     PlannedChange,
     TransformKind,
 )
+from cam_align_tool.core.regenerate import regenerate_hand_pellet_for_scorer
 from cam_align_tool.core.transforms import (
     atomic_replace,
     shift_detected_markers_npy,
@@ -26,7 +27,6 @@ from cam_align_tool.core.transforms import (
     shift_frame_list_file,
     shift_scorer_output_npy,
     shift_timestamp_file,
-    shift_timeseries_npy,
     shift_video_file,
     verify_transform,
     write_json,
@@ -58,6 +58,14 @@ def _norm(path: Path) -> str:
 
 def _contains_camera_token(path: Path, camera: str) -> bool:
     return camera.lower() in path.name.lower()
+
+
+def _supported_scorer_for_path(inspection: InspectionResult, path: Path):
+    parent = path.parent.resolve()
+    for scorer in inspection.scorer_folders:
+        if scorer.supports_hand_pellet_regen and scorer.path.resolve() == parent:
+            return scorer
+    return None
 
 
 def _target_frame_count(inspection: InspectionResult, secondary_camera: str) -> int:
@@ -124,13 +132,10 @@ def _artifact_for_path(path: Path, inspection: InspectionResult, secondary_camer
         )
 
     if name_lower in {"hand.npy", "pellet.npy"}:
-        return Artifact(
-            path=path,
-            action=ChangeAction.REWRITE,
-            reason="derived_timeseries_npy",
-            kind=TransformKind.NPY_TIMESERIES,
-            row_count=target_frame_count,
-        )
+        scorer = _supported_scorer_for_path(inspection, path)
+        if scorer is not None:
+            return Artifact(path=path, action=ChangeAction.INVALIDATE, reason="derived_trajectory_requires_regeneration")
+        return Artifact(path=path, action=ChangeAction.SKIP, reason="trajectory_regeneration_not_supported")
 
     if not _contains_camera_token(path, secondary_camera):
         if path.suffix.lower() == ".h5" and any(name_lower.endswith(pattern) for pattern in _SHIFTABLE_FUSED_H5_PATTERNS):
@@ -223,6 +228,7 @@ def build_plan(inspection: InspectionResult, secondary_camera: str, offset: int)
 
     rewrites: list[PlannedChange] = []
     invalidations: list[PlannedChange] = []
+    scorer_regenerations = [scorer for scorer in inspection.scorer_folders if scorer.supports_hand_pellet_regen]
     skips: list[Artifact] = []
     seen: set[str] = set()
 
@@ -249,6 +255,7 @@ def build_plan(inspection: InspectionResult, secondary_camera: str, offset: int)
         target_frame_count=target_frame_count,
         rewrites=len(rewrites),
         invalidations=len(invalidations),
+        scorer_regenerations=len(scorer_regenerations),
         skips=len(skips),
     )
     return CompensationPlan(
@@ -258,6 +265,7 @@ def build_plan(inspection: InspectionResult, secondary_camera: str, offset: int)
         target_frame_count=target_frame_count,
         rewrites=rewrites,
         invalidations=invalidations,
+        scorer_regenerations=scorer_regenerations,
         skips=skips,
     )
 
@@ -288,10 +296,14 @@ def summarize_plan(plan: CompensationPlan) -> PlanSummary:
     lines.append(f"Invalidate count: {len(plan.invalidations)}")
     for item in plan.invalidations:
         lines.append(f"  INVALIDATE: {item.artifact.path.relative_to(plan.inspection.root)}")
+    lines.append(f"Regeneration count: {len(plan.scorer_regenerations)}")
+    for scorer in plan.scorer_regenerations:
+        lines.append(f"  REGENERATE scorer trajectories: {scorer.path.relative_to(plan.inspection.root)}")
     lines.append(f"Skip count: {len(plan.skips)}")
     return PlanSummary(
         rewrite_count=len(plan.rewrites),
         invalidate_count=len(plan.invalidations),
+        regeneration_count=len(plan.scorer_regenerations),
         skip_count=len(plan.skips),
         details="\n".join(lines),
     )
@@ -318,6 +330,13 @@ def _backup_original(root: Path, txn_dir: Path, relpath: Path) -> Path:
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
     return dst
+
+
+def _find_scorer(inspection: InspectionResult, scorer_name: str):
+    for scorer in inspection.scorer_folders:
+        if scorer.name == scorer_name:
+            return scorer
+    return None
 
 
 def _planned_backup_relpaths(plan: CompensationPlan) -> list[Path]:
@@ -354,6 +373,12 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
     root = plan.inspection.root
     txn_dir = _new_transaction_dir(root)
     planned_backup_paths = [str(rel) for rel in _planned_backup_relpaths(plan)] if create_backup else []
+    planned_created_paths = []
+    for scorer in plan.scorer_regenerations:
+        for name in ("hand.npy", "pellet.npy"):
+            rel = Path(scorer.path.relative_to(root), name)
+            if not (root / rel).is_file():
+                planned_created_paths.append(str(rel))
     manifest: dict = {
         "status": "in_progress",
         "created_utc": datetime.utcnow().isoformat(),
@@ -366,9 +391,12 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
         "backup_enabled": bool(create_backup),
         "rewrite_paths": [str(item.artifact.path.relative_to(root)) for item in plan.rewrites],
         "invalidated_paths": [str(item.artifact.path.relative_to(root)) for item in plan.invalidations],
+        "scorer_regenerations": [str(scorer.path.relative_to(root)) for scorer in plan.scorer_regenerations],
         "planned_backup_paths": planned_backup_paths,
         "backed_up_paths": [],
         "restored_paths": [],
+        "generated_paths": [],
+        "created_paths": planned_created_paths,
         "undone": False,
     }
     write_json(_manifest_path(txn_dir), manifest)
@@ -420,8 +448,6 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
                 else:
                     camera_value = {"left": 4, "right": 5}.get(plan.secondary_camera, camera_value)
                 shift_detected_markers_npy(artifact.path, tmp_path, plan.offset, frame_count, camera_value)
-            elif artifact.kind == TransformKind.NPY_TIMESERIES:
-                shift_timeseries_npy(artifact.path, tmp_path, plan.offset, output_rows=artifact.row_count)
             else:
                 raise RuntimeError(f"Unhandled rewrite kind: {artifact.kind}")
             verify_transform(artifact.kind, source_for_verify, tmp_path, artifact.row_count)
@@ -432,6 +458,14 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
             rel = item.backup_relpath
             item.artifact.path.unlink(missing_ok=True)
             emit(f"Invalidated {rel}")
+
+        generated_paths: list[str] = []
+        for scorer in plan.scorer_regenerations:
+            emit(f"Regenerating hand/pellet trajectories for scorer {scorer.name}")
+            for out_path in regenerate_hand_pellet_for_scorer(scorer, plan.inspection, progress=progress):
+                rel = str(out_path.relative_to(root))
+                generated_paths.append(rel)
+        manifest["generated_paths"] = generated_paths
 
         manifest["status"] = "completed"
         write_json(_manifest_path(txn_dir), manifest)
@@ -446,6 +480,76 @@ def execute_plan(plan: CompensationPlan, progress: Optional[Callable[[str], None
             staging_root = txn_dir / "staging"
             if staging_root.exists():
                 shutil.rmtree(staging_root, ignore_errors=True)
+            manifest["status"] = "failed_no_backup"
+            manifest["rollback_error"] = str(exc)
+            write_json(_manifest_path(txn_dir), manifest)
+        raise
+
+
+def regenerate_scorer_outputs(
+    inspection: InspectionResult,
+    scorer_name: str,
+    progress: Optional[Callable[[str], None]] = None,
+    create_backup: bool = True,
+) -> Path:
+    scorer = _find_scorer(inspection, scorer_name)
+    if scorer is None:
+        raise RuntimeError(f"Scorer folder not found: {scorer_name}")
+    if not scorer.supports_hand_pellet_regen:
+        reason = scorer.regen_note or "required scorer files are not available"
+        raise RuntimeError(f"Scorer '{scorer.name}' does not support hand/pellet regeneration: {reason}")
+
+    root = inspection.root
+    txn_dir = _new_transaction_dir(root)
+    output_relpaths = [Path(scorer.path.relative_to(root), name) for name in ("hand.npy", "pellet.npy")]
+    existing_backup_paths = [str(rel) for rel in output_relpaths if (root / rel).is_file()] if create_backup else []
+    created_paths = [str(rel) for rel in output_relpaths if not (root / rel).is_file()]
+    manifest: dict = {
+        "status": "in_progress",
+        "created_utc": datetime.utcnow().isoformat(),
+        "root": str(root),
+        "mode": inspection.mode.value,
+        "transaction_type": "scorer_hand_pellet_regeneration",
+        "scorer_folder": str(scorer.path.relative_to(root)),
+        "backup_enabled": bool(create_backup),
+        "planned_backup_paths": existing_backup_paths,
+        "backed_up_paths": [],
+        "generated_paths": [],
+        "created_paths": created_paths,
+        "restored_paths": [],
+        "undone": False,
+    }
+    write_json(_manifest_path(txn_dir), manifest)
+
+    def emit(msg: str) -> None:
+        if callable(progress):
+            progress(msg)
+        log_event(_LOG, "regenerate_scorer_outputs_progress", message=msg)
+
+    try:
+        if create_backup:
+            for rel_str in existing_backup_paths:
+                rel = Path(rel_str)
+                _backup_original(root, txn_dir, rel)
+                manifest["backed_up_paths"].append(rel_str)
+                write_json(_manifest_path(txn_dir), manifest)
+                emit(f"Backed up {rel}")
+        else:
+            emit("Backup creation disabled; proceeding without transaction copies.")
+
+        generated_paths = regenerate_hand_pellet_for_scorer(scorer, inspection, progress=progress)
+        generated_rel = [str(path.relative_to(root)) for path in generated_paths]
+        manifest["generated_paths"] = generated_rel
+        manifest["status"] = "completed"
+        write_json(_manifest_path(txn_dir), manifest)
+        emit(f"Completed transaction {txn_dir.name}")
+        return _manifest_path(txn_dir)
+    except Exception as exc:
+        if create_backup:
+            emit(f"Failure encountered, rolling back: {exc}")
+            rollback_transaction(root, txn_dir, manifest=manifest, progress=progress, error=str(exc))
+        else:
+            emit(f"Failure encountered with backups disabled; rollback unavailable: {exc}")
             manifest["status"] = "failed_no_backup"
             manifest["rollback_error"] = str(exc)
             write_json(_manifest_path(txn_dir), manifest)
@@ -473,6 +577,14 @@ def rollback_transaction(root: Path, txn_dir: Path, manifest: Optional[dict] = N
         shutil.copy2(backup, dst)
         restored.append(str(rel))
         emit(f"Restored {rel}")
+
+    for rel_str in manifest.get("created_paths", []):
+        if rel_str in restored:
+            continue
+        dst = root / rel_str
+        if dst.is_file():
+            dst.unlink(missing_ok=True)
+            emit(f"Removed generated file {rel_str}")
 
     staging_root = txn_dir / "staging"
     if staging_root.exists():

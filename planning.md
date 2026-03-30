@@ -131,6 +131,8 @@ Before any in-place mutation:
   - `detected_markers.npy`
   - `detected_reaches.txt`
   - possibly trajectory arrays derived from both cameras
+  - `hand.npy`
+  - `pellet.npy`
 
 ## Major Risk Distinction
 
@@ -192,13 +194,16 @@ Standalone v1 workflow:
 
 1. choose mode and input folder
 2. auto-detect master/secondary cameras
-3. preview synchronized views
-4. determine offset by frame scrubbing
-5. dry-run summary of files to rewrite/regenerate/invalidate
-6. create backup transaction set
-7. explicit `Run offset compensation`
-8. perform compensation, regeneration, and verification
-9. allow explicit undo from backup
+3. auto-detect scorer folders from local session subdirectories
+4. preview synchronized views
+5. determine offset by frame scrubbing
+6. dry-run summary of files to rewrite/regenerate/invalidate
+7. expose a standalone widget to regenerate `hand.npy` and `pellet.npy` from existing scorer camera files when a compatible scorer folder exists
+8. create backup transaction set
+9. explicit `Run offset compensation`
+10. after offset compensation, automatically regenerate compatible scorer `hand.npy`/`pellet.npy` outputs from the newly compensated scorer camera files
+11. perform compensation, regeneration, and verification
+12. allow explicit undo from backup
 
 ### Integrated ReachX workflow
 
@@ -279,6 +284,7 @@ Recommended v1:
 - Directly rewrite clearly secondary-camera-only artifacts.
 - Automatically regenerate fused outputs when the regeneration path is well understood and available in the standalone tool.
 - Otherwise preserve originals in backup, mark fused outputs as pending regeneration, and do not claim they were safely rewritten.
+- For compatible standalone scorer folders, regenerate `hand.npy` and `pellet.npy` from scorer camera outputs rather than shifting stale trajectory arrays in place.
 
 ## Additional Considerations You Hadn't Explicitly Called Out
 
@@ -316,6 +322,10 @@ Recommended v1:
 - explicit undo operation
 - compensation of clearly secondary-scoped artifacts
 - explicit handling policy for high-risk derived artifacts
+- standalone scorer-folder detection
+- standalone hand/pellet regeneration widget, disabled when no compatible scorer folder exists
+- automatic hand/pellet regeneration after offset compensation when compatible scorer folders are present
+- post-run verification that includes regenerated `hand.npy`/`pellet.npy` frame-count checks
 
 ### Deferred unless you want it in v1
 

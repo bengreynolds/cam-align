@@ -63,6 +63,19 @@ class InspectionResult:
     warnings: tuple[str, ...] = ()
     reach_epochs: tuple["ReachEpoch", ...] = ()
     reaches_file_present: bool = False
+    scorer_folders: tuple["ScorerFolder", ...] = ()
+
+
+@dataclass(frozen=True)
+class ScorerFolder:
+    name: str
+    path: Path
+    camera_files: tuple[str, ...] = ()
+    has_detected_markers: bool = False
+    has_hand: bool = False
+    has_pellet: bool = False
+    supports_hand_pellet_regen: bool = False
+    regen_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -87,6 +100,7 @@ class CompensationPlan:
     target_frame_count: int
     rewrites: list[PlannedChange] = field(default_factory=list)
     invalidations: list[PlannedChange] = field(default_factory=list)
+    scorer_regenerations: list[ScorerFolder] = field(default_factory=list)
     skips: list[Artifact] = field(default_factory=list)
 
 
@@ -94,6 +108,7 @@ class CompensationPlan:
 class PlanSummary:
     rewrite_count: int
     invalidate_count: int
+    regeneration_count: int
     skip_count: int
     details: str
 

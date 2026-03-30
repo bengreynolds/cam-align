@@ -4,3 +4,4 @@ pandas>=1.5
 opencv-python>=4.8,<4.11
 tables>=3.8
 PyYAML>=6.0
+scipy>=1.10,<2

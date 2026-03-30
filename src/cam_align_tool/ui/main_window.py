@@ -27,7 +27,13 @@ from PySide6.QtWidgets import (
 
 from cam_align_tool.config.logging_utils import log_event
 from cam_align_tool.config.settings import AppSettings, save_settings
-from cam_align_tool.core.engine import execute_plan, inspect_and_plan, summarize_plan, undo_last_transaction
+from cam_align_tool.core.engine import (
+    execute_plan,
+    inspect_and_plan,
+    regenerate_scorer_outputs,
+    summarize_plan,
+    undo_last_transaction,
+)
 from cam_align_tool.core.inspect import inspect_input_folder
 from cam_align_tool.core.models import CompensationPlan, InspectionResult
 from cam_align_tool.core.postcheck import run_post_process_check
@@ -62,6 +68,10 @@ class MainWindow(QMainWindow):
         self.master_label = QLabel("-")
         self.mode_label = QLabel("-")
         self.secondary_combo = QComboBox()
+        self.scorer_combo = QComboBox()
+        self.scorer_combo.setEnabled(False)
+        self.regen_btn = QPushButton("Regenerate Hand/Pellet")
+        self.regen_btn.setEnabled(False)
         self.offset_spin = QSpinBox()
         self.offset_spin.setRange(-5000, 5000)
         self.offset_spin.setSingleStep(1)
@@ -113,6 +123,13 @@ class MainWindow(QMainWindow):
         top_form.addRow("Mode:", self.mode_label)
         top_form.addRow("Master camera:", self.master_label)
         top_form.addRow("Secondary target:", self.secondary_combo)
+        scorer_row = QWidget()
+        scorer_row_layout = QHBoxLayout()
+        scorer_row_layout.setContentsMargins(0, 0, 0, 0)
+        scorer_row_layout.addWidget(self.scorer_combo, 1)
+        scorer_row_layout.addWidget(self.regen_btn)
+        scorer_row.setLayout(scorer_row_layout)
+        top_form.addRow("Scorer outputs:", scorer_row)
         top_form.addRow("Offset:", self.offset_spin)
         top_form.addRow("Sign convention:", self.sign_label)
 
@@ -211,10 +228,12 @@ class MainWindow(QMainWindow):
         self.epoch_combo.currentIndexChanged.connect(self._jump_to_selected_epoch)
         self.prev_epoch_btn.clicked.connect(self._jump_to_prev_epoch)
         self.next_epoch_btn.clicked.connect(self._jump_to_next_epoch)
+        self.scorer_combo.currentTextChanged.connect(self._on_scorer_changed)
         self.offset_spin.valueChanged.connect(self._refresh_preview)
         self.secondary_combo.currentTextChanged.connect(self._on_secondary_changed)
         self.dry_run_btn.clicked.connect(self._dry_run)
         self.run_btn.clicked.connect(self._run_compensation)
+        self.regen_btn.clicked.connect(self._regenerate_hand_pellet)
         self.post_check_btn.clicked.connect(self._post_process_check)
         self.undo_btn.clicked.connect(self._undo_last)
         self._build_shortcuts()
@@ -398,6 +417,46 @@ class MainWindow(QMainWindow):
             return
         self.epoch_combo.setCurrentIndex(min(count, current + 1))
 
+    def _populate_scorer_selector(self) -> None:
+        self.scorer_combo.blockSignals(True)
+        self.scorer_combo.clear()
+        inspection = self._inspection
+        compatible = []
+        unsupported = []
+        if inspection is not None:
+            compatible = [scorer for scorer in inspection.scorer_folders if scorer.supports_hand_pellet_regen]
+            unsupported = [scorer for scorer in inspection.scorer_folders if not scorer.supports_hand_pellet_regen]
+        if compatible:
+            for scorer in compatible:
+                suffix = []
+                if scorer.has_hand:
+                    suffix.append("hand")
+                if scorer.has_pellet:
+                    suffix.append("pellet")
+                label = scorer.name if not suffix else f"{scorer.name} [{' + '.join(suffix)}]"
+                self.scorer_combo.addItem(label, scorer.name)
+            self.scorer_combo.setEnabled(True)
+            self.regen_btn.setEnabled(True)
+        else:
+            note = "No compatible scorer folders"
+            if unsupported:
+                note = unsupported[0].regen_note or note
+            self.scorer_combo.addItem(note, None)
+            self.scorer_combo.setEnabled(False)
+            self.regen_btn.setEnabled(False)
+        self.scorer_combo.blockSignals(False)
+
+    def _selected_scorer_name(self) -> str:
+        data = self.scorer_combo.currentData()
+        if isinstance(data, str):
+            return data
+        return ""
+
+    def _on_scorer_changed(self) -> None:
+        scorer_name = self._selected_scorer_name()
+        if scorer_name:
+            self._log_ui(f"Selected scorer folder {scorer_name} for hand/pellet regeneration.")
+
     def _browse_start_dir(self) -> str:
         current = Path(self.root_edit.text().strip())
         if current.is_dir():
@@ -525,6 +584,7 @@ class MainWindow(QMainWindow):
         self.secondary_combo.blockSignals(False)
         if self._settings.last_secondary_camera in secondaries:
             self.secondary_combo.setCurrentText(self._settings.last_secondary_camera)
+        self._populate_scorer_selector()
         self._populate_epoch_selector()
         max_frame = max(0, inspection.camera_files[inspection.master_camera].frame_count - 1)
         self.frame_slider.setRange(0, max_frame)
@@ -543,6 +603,11 @@ class MainWindow(QMainWindow):
                 "Length rule: after the shift, the secondary is trimmed or buffered at the tail to match the master when the mismatch is 100 frames or less.",
                 "Error rule: if the master/secondary mismatch exceeds 100 frames, the run stops as a significant acquisition alignment error.",
                 "Timestamp rule: the secondary timestamps file is rewritten with the same shift/length policy when present.",
+                (
+                    f"Scorer regeneration: {len([s for s in inspection.scorer_folders if s.supports_hand_pellet_regen])} compatible scorer folder(s) detected."
+                    if inspection.scorer_folders
+                    else "Scorer regeneration: no scorer folders detected."
+                ),
                 (
                     f"Pellet epoch navigation: {len(inspection.reach_epochs)} pellet-delivery epoch(s) available from events.txt."
                     if inspection.reach_epochs
@@ -672,8 +737,8 @@ class MainWindow(QMainWindow):
             self._log_ui(f"Plan failed: {exc}")
             QMessageBox.critical(self, "Plan failed", str(exc))
             return
-        if summary.rewrite_count == 0 and summary.invalidate_count == 0:
-            self._log_ui("Nothing to do; no rewrites or invalidations were planned.")
+        if summary.rewrite_count == 0 and summary.invalidate_count == 0 and summary.regeneration_count == 0:
+            self._log_ui("Nothing to do; no rewrites, invalidations, or regenerations were planned.")
             QMessageBox.information(self, "Nothing to do", "No changes were planned for the selected camera.")
             return
         self._log_report("Planned run summary", summary.details)
@@ -683,6 +748,7 @@ class MainWindow(QMainWindow):
             f"Offset: {plan.offset}\n"
             f"Rewrites: {summary.rewrite_count}\n"
             f"Invalidations: {summary.invalidate_count}\n\n"
+            f"Scorer regenerations: {summary.regeneration_count}\n\n"
         )
         if self._settings.create_backup:
             msg += "A transaction backup will be created automatically."
@@ -714,6 +780,43 @@ class MainWindow(QMainWindow):
         if self._settings.auto_post_check and self._inspection is not None:
             self._log_ui("Auto post-process check is enabled; running verification now.")
             self._post_process_check(reset_log=False)
+
+    def _regenerate_hand_pellet(self) -> None:
+        if self._inspection is None:
+            QMessageBox.information(self, "Unavailable", "Inspect a folder first.")
+            return
+        scorer_name = self._selected_scorer_name()
+        if not scorer_name:
+            QMessageBox.information(self, "Unavailable", "No compatible scorer folder is available for this session.")
+            return
+        self._start_log(f"Starting hand/pellet regeneration for {scorer_name}")
+        msg = (
+            f"Regenerate hand.npy and pellet.npy for scorer '{scorer_name}'?\n\n"
+            f"Source: existing scorer camera files in {scorer_name}\n"
+        )
+        if self._settings.create_backup:
+            msg += "A transaction backup will be created automatically."
+        else:
+            msg += "Backup creation is disabled. Existing files will be overwritten in place and undo may not be available."
+        if QMessageBox.question(self, "Confirm regeneration", msg) != QMessageBox.StandardButton.Yes:
+            self._log_ui("Hand/pellet regeneration cancelled by user.")
+            return
+        try:
+            manifest_path = regenerate_scorer_outputs(
+                self._inspection,
+                scorer_name,
+                progress=self._append_summary,
+                create_backup=self._settings.create_backup,
+            )
+        except Exception as exc:
+            self._log_ui(f"Hand/pellet regeneration failed: {exc}")
+            QMessageBox.critical(self, "Regeneration failed", str(exc))
+            self._set_status(f"Regeneration failed: {exc}")
+            return
+        self._append_summary(f"Manifest written: {manifest_path}")
+        self._set_status("Hand/pellet regeneration completed successfully.")
+        self._log_ui("Refreshing inspection after regeneration.")
+        self._inspect_root(reset_log=False)
 
     def _post_process_check(self, reset_log: bool = True) -> None:
         if self._inspection is None:

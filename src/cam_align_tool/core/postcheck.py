@@ -265,6 +265,28 @@ def run_post_process_check(inspection: InspectionResult, secondary_camera: str,
         lines.append("  - No dense side/front or left/right file pairs were found.")
 
     lines.append("")
+    scorer_folders = [scorer for scorer in inspection.scorer_folders if scorer.supports_hand_pellet_regen]
+    emit("Checking regenerated hand/pellet scorer trajectories.")
+    lines.append("Scorer trajectory checks:")
+    if scorer_folders:
+        expected_rows = inspection.camera_files[inspection.master_camera].frame_count
+        for scorer in scorer_folders:
+            for name in ("hand.npy", "pellet.npy"):
+                path = Path(scorer.path, name)
+                rel = path.relative_to(inspection.root)
+                if not path.is_file():
+                    lines.append(f"  - {rel}: MISSING")
+                    failures.append(f"Missing regenerated scorer trajectory: {rel}")
+                    continue
+                rows = _npy_frame_count(path)
+                ok = rows == expected_rows
+                lines.append(f"  - {rel}: {rows} vs expected {expected_rows} {'PASS' if ok else 'FAIL'}")
+                if not ok:
+                    failures.append(f"Trajectory length mismatch: {rel} => {rows} vs expected {expected_rows}")
+    else:
+        lines.append("  - No compatible legacy scorer folders were found for hand/pellet verification.")
+
+    lines.append("")
     if inspection.warnings:
         lines.append("Inspection warnings:")
         lines.extend([f"  - {warning}" for warning in inspection.warnings])

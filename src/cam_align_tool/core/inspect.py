@@ -14,7 +14,7 @@ except Exception:
     cv2 = None
 
 from cam_align_tool.config.logging_utils import log_event
-from cam_align_tool.core.models import CameraFile, InspectionResult, ReachEpoch, SessionMode
+from cam_align_tool.core.models import CameraFile, InspectionResult, ReachEpoch, ScorerFolder, SessionMode
 
 _LOG = logging.getLogger("cam_align_tool.core.inspect")
 
@@ -23,6 +23,7 @@ _FIXED_CAMS = ["left", "right"]
 _VIDEO_EXTS = [".mp4", ".avi", ".mov", ".mkv"]
 _IGNORED_CAMERA_NAMES = {"stimcam", "cam3"}
 _SUPPORTED_FRAME_RATES = {30, 60, 90, 120, 150, 180, 200, 240}
+_SCORER_DIR_IGNORES = {".cam_align_backup", ".cam_align_state", ".git", "__pycache__"}
 
 
 def _is_ignored_camera_name(name: str) -> bool:
@@ -98,6 +99,36 @@ def _find_reaches_file(root: Path, prefix: str) -> Optional[Path]:
         ]
     )
     return matches[0] if matches else None
+
+
+def _scan_scorer_folders(root: Path, mode: SessionMode) -> tuple[ScorerFolder, ...]:
+    required = ("left.npy", "right.npy") if mode == SessionMode.FIXED_CAM else ("sideCam.npy", "frontCam.npy")
+    out: list[ScorerFolder] = []
+    for path in sorted([p for p in root.iterdir() if p.is_dir()]):
+        if path.name.lower() in _SCORER_DIR_IGNORES:
+            continue
+        present = tuple(name for name in required if Path(path, name).is_file())
+        if len(present) == 0:
+            continue
+        supports = mode == SessionMode.LEGACY and len(present) == len(required)
+        note = ""
+        if len(present) != len(required):
+            note = f"missing required camera scorer files: {sorted(set(required) - set(present))}"
+        elif mode == SessionMode.FIXED_CAM:
+            note = "hand/pellet regeneration is not implemented for fixed-cam scorer outputs"
+        out.append(
+            ScorerFolder(
+                name=path.name,
+                path=path,
+                camera_files=present,
+                has_detected_markers=Path(path, "detected_markers.npy").is_file(),
+                has_hand=Path(path, "hand.npy").is_file(),
+                has_pellet=Path(path, "pellet.npy").is_file(),
+                supports_hand_pellet_regen=supports,
+                regen_note=note,
+            )
+        )
+    return tuple(out)
 
 
 def _camera_mode(videos: dict[str, Path]) -> SessionMode:
@@ -391,6 +422,7 @@ def inspect_input_folder(root: Path) -> InspectionResult:
             if p.is_file() and ".cam_align_backup" not in {part.lower() for part in p.parts}
         ]
     )
+    scorer_folders = _scan_scorer_folders(root, mode)
     reach_epochs, epoch_warnings = _build_reach_epochs(root, prefix)
     warnings.extend(epoch_warnings)
     cameras = sorted(camera_files.keys())
@@ -403,6 +435,7 @@ def inspect_input_folder(root: Path) -> InspectionResult:
         cameras="|".join(cameras),
         warnings=len(warnings),
         reach_epochs=len(reach_epochs),
+        scorer_folders=len(scorer_folders),
     )
     return InspectionResult(
         root=root,
@@ -415,4 +448,5 @@ def inspect_input_folder(root: Path) -> InspectionResult:
         warnings=tuple(warnings),
         reach_epochs=reach_epochs,
         reaches_file_present=_find_reaches_file(root, prefix) is not None,
+        scorer_folders=scorer_folders,
     )
