@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -164,16 +165,41 @@ class MainWindow(QMainWindow):
         if chosen:
             self.root_edit.setText(chosen)
 
-    def _inspect_root(self) -> None:
+    @staticmethod
+    def _log_stamp() -> str:
+        return datetime.now().strftime("%H:%M:%S")
+
+    def _log_ui(self, text: str) -> None:
+        for line in str(text).splitlines() or [""]:
+            self.summary_edit.appendPlainText(f"[{self._log_stamp()}] {line}")
+        self.summary_edit.ensureCursorVisible()
+
+    def _start_log(self, title: str) -> None:
+        self.summary_edit.clear()
+        self._log_ui(title)
+
+    def _log_report(self, title: str, text: str) -> None:
+        self._log_ui(title)
+        for line in text.splitlines():
+            self._log_ui(f"    {line}")
+
+    def _inspect_root(self, reset_log: bool = True) -> None:
         root = Path(self.root_edit.text().strip())
+        if reset_log:
+            self._start_log(f"Inspecting {root}")
+        else:
+            self._log_ui(f"Refreshing inspection for {root}")
         try:
+            self._log_ui("Reading systemdata, camera videos, timestamps, and dropped-frame warnings.")
             inspection = inspect_input_folder(root)
         except Exception as exc:
+            self._log_ui(f"Inspection failed: {exc}")
             QMessageBox.critical(self, "Inspection failed", str(exc))
             self._set_status(f"Inspection failed: {exc}")
             return
         self._inspection = inspection
         self._plan = None
+        self._log_ui(f"Inspection succeeded. Master={inspection.master_camera}; cameras={', '.join(inspection.cameras)}")
         self.mode_label.setText(inspection.mode.value)
         self.master_label.setText(inspection.master_camera)
         self.secondary_combo.blockSignals(True)
@@ -185,7 +211,8 @@ class MainWindow(QMainWindow):
             self.secondary_combo.setCurrentText(self._settings.last_secondary_camera)
         self.frame_slider.setRange(0, max(0, inspection.camera_files[inspection.master_camera].frame_count - 1))
         self._video_provider.set_paths({cam: info.video_path for cam, info in inspection.camera_files.items()})
-        self.summary_edit.setPlainText(
+        self._log_report(
+            "Inspection summary",
             "\n".join([
                 f"Root: {inspection.root}",
                 f"Mode: {inspection.mode.value}",
@@ -205,11 +232,12 @@ class MainWindow(QMainWindow):
                 *(["", "Warnings:", *[f"  - {warning}" for warning in inspection.warnings]] if inspection.warnings else []),
                 "",
                 "Use Dry Run before executing compensation.",
-            ])
+            ]),
         )
         self._refresh_preview()
         self._set_status("Inspection complete.")
         if inspection.warnings:
+            self._log_ui("Inspection warnings were found; user confirmation dialog will be shown.")
             QMessageBox.warning(
                 self,
                 "Dropped-frame warning",
@@ -220,6 +248,10 @@ class MainWindow(QMainWindow):
 
     def _on_secondary_changed(self) -> None:
         self._plan = None
+        if self._inspection is not None:
+            secondary = self.secondary_combo.currentText().strip()
+            if secondary:
+                self._log_ui(f"Secondary camera changed to {secondary}.")
         self._refresh_preview()
 
     def _scaled_pixmap(self, camera: str, frame_index: int, label: QLabel) -> Optional[QPixmap]:
@@ -282,26 +314,34 @@ class MainWindow(QMainWindow):
         return plan
 
     def _dry_run(self) -> None:
+        self._start_log("Starting dry run")
         try:
+            self._log_ui("Building compensation plan.")
             plan = self._ensure_plan()
             summary = summarize_plan(plan)
         except Exception as exc:
+            self._log_ui(f"Dry run failed: {exc}")
             QMessageBox.critical(self, "Dry run failed", str(exc))
             self._set_status(f"Dry run failed: {exc}")
             return
-        self.summary_edit.setPlainText(summary.details)
+        self._log_report("Dry-run summary", summary.details)
         self._set_status("Dry run complete.")
 
     def _run_compensation(self) -> None:
+        self._start_log("Starting compensation run")
         try:
+            self._log_ui("Building final compensation plan.")
             plan = self._ensure_plan()
             summary = summarize_plan(plan)
         except Exception as exc:
+            self._log_ui(f"Plan failed: {exc}")
             QMessageBox.critical(self, "Plan failed", str(exc))
             return
         if summary.rewrite_count == 0 and summary.invalidate_count == 0:
+            self._log_ui("Nothing to do; no rewrites or invalidations were planned.")
             QMessageBox.information(self, "Nothing to do", "No changes were planned for the selected camera.")
             return
+        self._log_report("Planned run summary", summary.details)
         msg = (
             f"Proceed with in-place compensation?\n\n"
             f"Secondary: {plan.secondary_camera}\n"
@@ -311,22 +351,26 @@ class MainWindow(QMainWindow):
             f"A transaction backup will be created automatically."
         )
         if plan.inspection.warnings:
+            self._log_ui("Plan contains inspection warnings; run confirmation will include them.")
             msg += (
                 "\n\nWarning: timestamp inspection found possible in-recording dropped frames or timestamp inconsistencies. "
                 "This tool does not repair those conditions."
             )
         if QMessageBox.question(self, "Confirm compensation", msg) != QMessageBox.StandardButton.Yes:
+            self._log_ui("Compensation cancelled by user.")
             return
-        self.summary_edit.clear()
+        self._start_log("Executing compensation")
         try:
             manifest_path = execute_plan(plan, progress=self._append_summary)
         except Exception as exc:
+            self._log_ui(f"Compensation failed: {exc}")
             QMessageBox.critical(self, "Compensation failed", str(exc))
             self._set_status(f"Compensation failed: {exc}")
             return
         self._append_summary(f"Manifest written: {manifest_path}")
         self._set_status("Compensation completed successfully.")
-        self._inspect_root()
+        self._log_ui("Refreshing inspection after compensation.")
+        self._inspect_root(reset_log=False)
 
     def _post_process_check(self) -> None:
         if self._inspection is None:
@@ -336,18 +380,21 @@ class MainWindow(QMainWindow):
         if not secondary:
             QMessageBox.information(self, "Post-process check unavailable", "Choose a secondary camera first.")
             return
-        self.summary_edit.clear()
+        self._start_log(f"Starting post-process check for {secondary}")
         try:
             report = run_post_process_check(self._inspection, secondary, progress=self._append_summary)
         except Exception as exc:
+            self._log_ui(f"Post-process check failed: {exc}")
             QMessageBox.critical(self, "Post-process check failed", str(exc))
             self._set_status(f"Post-process check failed: {exc}")
             return
-        self.summary_edit.setPlainText(report.details)
+        self._log_report("Post-process report", report.details)
         if report.passed:
+            self._log_ui("Post-process check passed.")
             self._set_status("Post-process check passed.")
             QMessageBox.information(self, "Post-process check", "All checked dense pairs matched.")
         else:
+            self._log_ui("Post-process check found mismatches.")
             self._set_status("Post-process check found mismatches.")
             QMessageBox.warning(self, "Post-process check", "One or more checked dense pairs did not match. Review the report.")
 
@@ -356,22 +403,24 @@ class MainWindow(QMainWindow):
         if not root.is_dir():
             QMessageBox.information(self, "Undo unavailable", "Select a valid folder first.")
             return
+        self._start_log(f"Starting undo for {root}")
         if QMessageBox.question(self, "Confirm undo", "Restore the most recent completed compensation backup?") != QMessageBox.StandardButton.Yes:
+            self._log_ui("Undo cancelled by user.")
             return
-        self.summary_edit.clear()
         try:
             manifest_path = undo_last_transaction(root, progress=self._append_summary)
         except Exception as exc:
+            self._log_ui(f"Undo failed: {exc}")
             QMessageBox.critical(self, "Undo failed", str(exc))
             self._set_status(f"Undo failed: {exc}")
             return
         self._append_summary(f"Undo manifest updated: {manifest_path}")
         self._set_status("Undo completed successfully.")
-        self._inspect_root()
+        self._log_ui("Refreshing inspection after undo.")
+        self._inspect_root(reset_log=False)
 
     def _append_summary(self, text: str) -> None:
-        self.summary_edit.appendPlainText(text)
-        self.summary_edit.ensureCursorVisible()
+        self._log_ui(text)
 
     def _set_status(self, text: str) -> None:
         self.status_label.setText(text)
