@@ -843,10 +843,15 @@ class MainWindow(QMainWindow):
             self._set_status(f"Post-process check failed: {exc}")
             return
         self._log_report("Post-process report", report.details)
+        has_warnings_only = report.passed and "Overall result: PASS WITH WARNINGS" in report.details
         if report.passed:
-            self._log_ui("Post-process check passed.")
-            self._set_status("Post-process check passed.")
-            QMessageBox.information(self, "Post-process check", "All checked dense pairs matched.")
+            if has_warnings_only:
+                self._log_ui("Post-process check passed with warnings.")
+                self._set_status("Post-process check passed with warnings.")
+            else:
+                self._log_ui("Post-process check passed.")
+                self._set_status("Post-process check passed.")
+                QMessageBox.information(self, "Post-process check", "All checked dense pairs matched.")
         else:
             self._log_ui("Post-process check found mismatches.")
             self._set_status("Post-process check found mismatches.")

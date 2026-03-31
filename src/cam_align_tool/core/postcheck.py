@@ -228,6 +228,7 @@ def run_post_process_check(inspection: InspectionResult, secondary_camera: str,
         "",
     ]
     failures: list[str] = []
+    warnings: list[str] = []
     ffprobe_exe = resolve_ffprobe_path(ffprobe_path)
 
     master_video = inspection.camera_files[master].video_path
@@ -254,7 +255,7 @@ def run_post_process_check(inspection: InspectionResult, secondary_camera: str,
                 f"{secondary_video.name}={secondary_meta.get('codec_name')}/{secondary_meta.get('codec_tag_string')}"
             )
         if master_meta.get("avg_frame_rate") != secondary_meta.get("avg_frame_rate"):
-            failures.append(
+            warnings.append(
                 f"Video frame-rate metadata mismatch: {master_video.name}={master_meta.get('avg_frame_rate')} vs "
                 f"{secondary_video.name}={secondary_meta.get('avg_frame_rate')}"
             )
@@ -332,7 +333,16 @@ def run_post_process_check(inspection: InspectionResult, secondary_camera: str,
         lines.append("")
 
     passed = len(failures) == 0
-    lines.append(f"Overall result: {'PASS' if passed else 'FAIL'}")
+    if failures:
+        overall = "FAIL"
+    elif warnings:
+        overall = "PASS WITH WARNINGS"
+    else:
+        overall = "PASS"
+    lines.append(f"Overall result: {overall}")
+    if warnings:
+        lines.append("Warnings:")
+        lines.extend([f"  - {warning}" for warning in warnings])
     if failures:
         lines.append("Failures:")
         lines.extend([f"  - {failure}" for failure in failures])
