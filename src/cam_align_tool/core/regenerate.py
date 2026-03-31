@@ -122,7 +122,7 @@ def _interpolate_low_confidence(values: np.ndarray, likelihood: np.ndarray) -> n
 
 
 def _build_traj(x: np.ndarray, x_lhood: np.ndarray, y: np.ndarray, z: np.ndarray, yz_lhood: np.ndarray,
-                frame_rate: int) -> np.ndarray:
+                frame_rate: float) -> np.ndarray:
     x = _interpolate_low_confidence(x, x_lhood)
     y = _interpolate_low_confidence(y, yz_lhood)
     z = _interpolate_low_confidence(z, yz_lhood)
@@ -180,7 +180,11 @@ def regenerate_hand_pellet_for_scorer(
             f"Scorer '{scorer.name}' has mismatched camera frame counts: sideCam={n_frames_side}, frontCam={n_frames_front}"
         )
     n_frames = n_frames_side
-    frame_rate = int(round(inspection.camera_files[inspection.master_camera].fps)) or 30
+    frame_rate = float(inspection.camera_files[inspection.master_camera].fps)
+    if frame_rate <= 0:
+        raise RuntimeError(
+            f"Invalid frame rate for master camera {inspection.master_camera}: {inspection.camera_files[inspection.master_camera].fps}"
+        )
 
     pellet_side = _rows_for_part(side, _PELLET_BP, n_frames, side_path.name)
     pellet_front = _rows_for_part(front, _PELLET_BP, n_frames, front_path.name)

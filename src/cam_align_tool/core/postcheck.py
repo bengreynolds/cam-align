@@ -67,6 +67,28 @@ def _ffprobe_video_frame_count(path: Path, ffprobe_exe: str) -> int:
     raise RuntimeError(f"ffprobe did not report a usable frame count for {path.name}")
 
 
+def _ffprobe_video_metadata(path: Path, ffprobe_exe: str) -> dict[str, str]:
+    cmd = [
+        ffprobe_exe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name,codec_tag_string,avg_frame_rate,width,height,nb_frames",
+        "-of",
+        "json",
+        str(path),
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    payload = json.loads(out.stdout or "{}")
+    streams = payload.get("streams") or []
+    if not streams:
+        raise RuntimeError(f"ffprobe returned no video stream for {path.name}")
+    stream = streams[0]
+    return {str(k): str(v) for k, v in stream.items() if v is not None}
+
+
 def _cv2_video_frame_count(path: Path) -> int:
     cap = cv2.VideoCapture(str(path))
     try:
@@ -213,12 +235,29 @@ def run_post_process_check(inspection: InspectionResult, secondary_camera: str,
     emit("Checking video lengths with OpenCV and ffprobe when available.")
     lines.append("Video checks:")
     if ffprobe_exe:
+        master_meta = _ffprobe_video_metadata(master_video, ffprobe_exe)
+        secondary_meta = _ffprobe_video_metadata(secondary_video, ffprobe_exe)
         master_ffprobe = _ffprobe_video_frame_count(master_video, ffprobe_exe)
         secondary_ffprobe = _ffprobe_video_frame_count(secondary_video, ffprobe_exe)
         lines.append(f"  - ffprobe path: {ffprobe_exe}")
+        lines.append(
+            "  - ffprobe stream metadata: "
+            f"{master_video.name}=codec:{master_meta.get('codec_name', '?')}/{master_meta.get('codec_tag_string', '?')} fps:{master_meta.get('avg_frame_rate', '?')}, "
+            f"{secondary_video.name}=codec:{secondary_meta.get('codec_name', '?')}/{secondary_meta.get('codec_tag_string', '?')} fps:{secondary_meta.get('avg_frame_rate', '?')}"
+        )
         lines.append(f"  - ffprobe frame counts: {master_video.name}={master_ffprobe}, {secondary_video.name}={secondary_ffprobe}")
         if master_ffprobe != secondary_ffprobe:
             failures.append(f"Video frame count mismatch: {master_ffprobe} vs {secondary_ffprobe}")
+        if master_meta.get("codec_name") != secondary_meta.get("codec_name") or master_meta.get("codec_tag_string") != secondary_meta.get("codec_tag_string"):
+            failures.append(
+                f"Video codec mismatch: {master_video.name}={master_meta.get('codec_name')}/{master_meta.get('codec_tag_string')} vs "
+                f"{secondary_video.name}={secondary_meta.get('codec_name')}/{secondary_meta.get('codec_tag_string')}"
+            )
+        if master_meta.get("avg_frame_rate") != secondary_meta.get("avg_frame_rate"):
+            failures.append(
+                f"Video frame-rate metadata mismatch: {master_video.name}={master_meta.get('avg_frame_rate')} vs "
+                f"{secondary_video.name}={secondary_meta.get('avg_frame_rate')}"
+            )
     else:
         master_ffprobe = None
         secondary_ffprobe = None

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
+from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 
@@ -231,10 +233,60 @@ def _video_info(path: Path) -> tuple[int, float, int, int]:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if fps <= 0:
-            fps = 30.0
+            ffprobe = _resolve_ffprobe_path()
+            if ffprobe is not None:
+                fps = _ffprobe_fps(path, ffprobe)
+        if fps <= 0:
+            raise RuntimeError(f"Unable to determine frame rate for video: {path}")
         return frame_count, fps, width, height
     finally:
         cap.release()
+
+
+def _resolve_ffprobe_path() -> Optional[str]:
+    path = shutil.which("ffprobe")
+    if path:
+        return path
+    candidates = [
+        Path.home() / "AppData/Local/Microsoft/WinGet/Links/ffprobe.exe",
+        Path("C:/Program Files/CBD/CHITUBOX_Basic/Resources/DependentSoftware/recordOrShot/ffprobe.exe"),
+    ]
+    winget_root = Path.home() / "AppData/Local/Microsoft/WinGet/Packages"
+    candidates.extend(sorted(winget_root.glob("Gyan.FFmpeg_*/*/bin/ffprobe.exe")))
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _ffprobe_fps(path: Path, ffprobe_exe: str) -> float:
+    import json
+    import subprocess
+
+    cmd = [
+        ffprobe_exe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate",
+        "-of",
+        "json",
+        str(path),
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    payload = json.loads(out.stdout or "{}")
+    streams = payload.get("streams") or []
+    if not streams:
+        return 0.0
+    rate = str(streams[0].get("avg_frame_rate", "") or "").strip()
+    if not rate or rate in {"0/0", "N/A"}:
+        return 0.0
+    try:
+        return float(Fraction(rate))
+    except Exception:
+        return 0.0
 
 
 def _load_timestamp_intervals(path: Path) -> np.ndarray:

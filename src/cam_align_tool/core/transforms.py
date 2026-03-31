@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import shutil
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Optional, TypeVar
 
@@ -18,6 +20,132 @@ from cam_align_tool.core.models import TransformKind
 T = TypeVar("T")
 
 
+def _resolve_ffprobe_path() -> Optional[str]:
+    path = shutil.which("ffprobe")
+    if path:
+        return path
+    candidates = [
+        Path.home() / "AppData/Local/Microsoft/WinGet/Links/ffprobe.exe",
+        Path("C:/Program Files/CBD/CHITUBOX_Basic/Resources/DependentSoftware/recordOrShot/ffprobe.exe"),
+    ]
+    winget_root = Path.home() / "AppData/Local/Microsoft/WinGet/Packages"
+    candidates.extend(sorted(winget_root.glob("Gyan.FFmpeg_*/*/bin/ffprobe.exe")))
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _resolve_ffmpeg_path() -> Optional[str]:
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    ffprobe = _resolve_ffprobe_path()
+    if ffprobe:
+        candidate = Path(ffprobe).with_name("ffmpeg.exe")
+        if candidate.is_file():
+            return str(candidate)
+    candidates = [
+        Path.home() / "AppData/Local/Microsoft/WinGet/Links/ffmpeg.exe",
+        Path("C:/Program Files/CBD/CHITUBOX_Basic/Resources/DependentSoftware/recordOrShot/ffmpeg.exe"),
+    ]
+    winget_root = Path.home() / "AppData/Local/Microsoft/WinGet/Packages"
+    candidates.extend(sorted(winget_root.glob("Gyan.FFmpeg_*/*/bin/ffmpeg.exe")))
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _ffprobe_stream_metadata(path: Path) -> dict[str, str]:
+    ffprobe = _resolve_ffprobe_path()
+    if ffprobe is None:
+        return {}
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name,codec_tag_string,avg_frame_rate,width,height,nb_frames",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        payload = json.loads(out.stdout or "{}")
+    except Exception:
+        return {}
+    streams = payload.get("streams") or []
+    if not streams:
+        return {}
+    stream = streams[0]
+    return {str(k): str(v) for k, v in stream.items() if v is not None}
+
+
+def _write_video_ffmpeg(dst: Path, shifted: list[np.ndarray], width: int, height: int, fps_expr: str) -> bool:
+    ffmpeg = _resolve_ffmpeg_path()
+    if ffmpeg is None or len(shifted) == 0:
+        return False
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        fps_expr,
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(dst),
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except Exception:
+        return False
+    try:
+        assert proc.stdin is not None
+        for frame in shifted:
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+        _stdout, stderr = proc.communicate()
+    except Exception:
+        proc.kill()
+        proc.wait()
+        return False
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg video rewrite failed for {dst.name}: {stderr.decode('utf-8', errors='replace')[:500]}")
+    return True
+
+
+def _fps_from_expr(fps_expr: str) -> float:
+    text = str(fps_expr or "").strip()
+    if not text or text in {"0/0", "N/A"}:
+        return 0.0
+    try:
+        return float(Fraction(text))
+    except Exception:
+        try:
+            return float(text)
+        except Exception:
+            return 0.0
+
+
 def shift_video_file(src: Path, dst: Path, offset: int, output_frame_count: Optional[int] = None) -> None:
     if cv2 is None:
         raise RuntimeError("opencv-python is required for video rewriting.")
@@ -28,8 +156,13 @@ def shift_video_file(src: Path, dst: Path, offset: int, output_frame_count: Opti
         fps = float(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if fps <= 0:
-            fps = 30.0
+        source_meta = _ffprobe_stream_metadata(src)
+        fps_expr = source_meta.get("avg_frame_rate", "") or f"{fps:.9f}"
+        if fps_expr in {"0/0", "N/A"}:
+            fps_expr = f"{fps:.9f}"
+        fps_value = _fps_from_expr(fps_expr)
+        if fps_value <= 0:
+            raise RuntimeError(f"Unable to determine frame rate for video rewrite: {src}")
 
         frames: list[np.ndarray] = []
         while True:
@@ -53,10 +186,13 @@ def shift_video_file(src: Path, dst: Path, offset: int, output_frame_count: Opti
                 src_idx = len(frames) - 1
             shifted.append(frames[src_idx])
 
-        fourcc_tags = ["mp4v", "avc1"] if dst.suffix.lower() == ".mp4" else ["XVID", "MJPG"]
+        if dst.suffix.lower() == ".mp4" and _write_video_ffmpeg(dst, shifted, width, height, fps_expr):
+            return
+
+        fourcc_tags = ["avc1", "mp4v"] if dst.suffix.lower() == ".mp4" else ["XVID", "MJPG"]
         writer = None
         for tag in fourcc_tags:
-            writer = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*tag), fps, (width, height))
+            writer = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*tag), fps_value, (width, height))
             if writer.isOpened():
                 break
             writer.release()
@@ -326,6 +462,27 @@ def verify_transform(kind: TransformKind, original: Path, candidate: Path, expec
         wanted = old_count if expected_rows is None else int(expected_rows)
         if new_count != wanted:
             raise RuntimeError(f"Video frame-count mismatch after rewrite: {new_count} vs {wanted}")
+        original_meta = _ffprobe_stream_metadata(original)
+        candidate_meta = _ffprobe_stream_metadata(candidate)
+        original_codec = original_meta.get("codec_name", "")
+        candidate_codec = candidate_meta.get("codec_name", "")
+        if original_codec == "h264" and candidate_codec and candidate_codec != "h264":
+            raise RuntimeError(
+                f"Video codec mismatch after rewrite: expected h264-compatible output, got {candidate_codec or 'unknown'}"
+            )
+        original_rate = original_meta.get("avg_frame_rate", "")
+        candidate_rate = candidate_meta.get("avg_frame_rate", "")
+        if original_rate and candidate_rate and original_rate not in {"0/0", "N/A"} and candidate_rate not in {"0/0", "N/A"}:
+            try:
+                old_fps = float(Fraction(original_rate))
+                new_fps = float(Fraction(candidate_rate))
+            except Exception:
+                old_fps = None
+                new_fps = None
+            if old_fps is not None and new_fps is not None and abs(float(old_fps) - float(new_fps)) > 1e-4:
+                raise RuntimeError(
+                    f"Video frame-rate mismatch after rewrite: {candidate_rate} vs original {original_rate}"
+                )
         return
     if kind == TransformKind.TIMESTAMPS:
         lines = [line for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
