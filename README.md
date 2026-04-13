@@ -14,9 +14,17 @@ Standalone camera alignment and offset compensation app.
 
 ## Install And Run
 
+Create or activate the shared conda environment:
+
+```powershell
+conda create -n reachxtools python=3.10
+conda activate reachxtools
+```
+
 Install dependencies and run the GUI from the repo:
 
 ```powershell
+cd cam-align
 python -m pip install -r requirements.txt
 python run_app.py
 ```
@@ -24,6 +32,8 @@ python run_app.py
 Or install the package locally and use the console script:
 
 ```powershell
+conda activate reachxtools
+cd cam-align
 python -m pip install -e .
 cam-align
 ```
